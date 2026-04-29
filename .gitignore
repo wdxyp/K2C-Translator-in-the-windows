@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller
+.build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# VS Code / Trae
+.vscode/
+.trae/
+
+# Model and Data files (too large for GitHub)
+*.pth
+*.pt
+*.pkl
+*.xlsx
+*.csv
+*.tsv
+*.h5
+*.hdf5
+*.bin
+
+# Log files
+*.log
