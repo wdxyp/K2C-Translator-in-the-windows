@@ -1,31 +1,10 @@
-import argparse
-import os
-import re
-import tempfile
-import unicodedata
-from contextlib import nullcontext
-from datetime import datetime
-import math
-from pathlib import Path
-
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Dataset
-
-import openpyxl
-
-try:
-    import sentencepiece as spm
-    spm_import_error = None
-except Exception as e:
-    spm = None
-    spm_import_error = str(e)
-
+import pickle
+import os
+import re
+import unicodedata
 
 def _normalize_text(sentence: str) -> str:
     if not isinstance(sentence, str):
@@ -79,36 +58,7 @@ def _separate_punct_boundaries(text: str) -> str:
     s = s.replace("->", " -> ")
     s = s.replace("...", " ... ")
 
-    for ch in [
-        "(",
-        ")",
-        "[",
-        "]",
-        "{",
-        "}",
-        "<",
-        ">",
-        ",",
-        ":",
-        ";",
-        "?",
-        "!",
-        "/",
-        "\\",
-        "$",
-        "#",
-        "@",
-        "~",
-        "&",
-        "*",
-        "%",
-        "+",
-        "=",
-        '"',
-        "_",
-        "-",
-        "·",
-    ]:
+    for ch in ["(", ")", "[", "]", "{", "}", "<", ">", ",", ":", ";", "?", "!", "/", "\\", "$", "#", "@", "~", "&", "*", "%", "+", "=", '"', "_", "-", "·"]:
         s = s.replace(ch, f" {ch} ")
 
     s = re.sub(r"(?<!\d)\.(?!\d)", " . ", s)
@@ -116,13 +66,13 @@ def _separate_punct_boundaries(text: str) -> str:
     return s
 
 
-def clean_text(sentence: str) -> str:
+def clean_text(sentence):
     if not isinstance(sentence, str):
         return ""
     s = _normalize_text(sentence)
     s = s.replace("\n", " ")
 
-    kept: list[str] = []
+    kept = []
     for ch in s:
         if ch.isspace():
             kept.append(" ")
@@ -151,146 +101,128 @@ def clean_text(sentence: str) -> str:
     return s
 
 
-def find_excel_files(inputs: list[str]) -> list[str]:
-    file_paths: list[str] = []
-    for raw in inputs:
-        p = Path(raw)
-        if p.is_file() and p.suffix.lower() == ".xlsx":
-            file_paths.append(str(p))
-            continue
-        if p.is_dir():
-            file_paths.extend(str(x) for x in p.rglob("*.xlsx"))
-            continue
-        if "*" in raw or "?" in raw:
-            file_paths.extend(str(x) for x in Path().glob(raw))
-            continue
-    file_paths = sorted(set(file_paths))
-    return file_paths
+def split_by_parentheses(text):
+    if not isinstance(text, str) or not text:
+        return [""]
+    pattern = r"(\([^()]*\)|（[^（）]*）)"
+    parts = re.split(pattern, text)
+    return [p for p in parts if p is not None and p != ""]
 
 
-def read_corpus(file_paths: list[str]) -> tuple[list[str], list[str]]:
-    all_korean: list[str] = []
-    all_chinese: list[str] = []
-    for path in file_paths:
-        try:
-            wb = openpyxl.load_workbook(path, data_only=True)
-            ws = wb.active
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if len(row) >= 4:
-                    ko, zh = row[1], row[3]
-                    if ko and zh:
-                        all_korean.append(str(ko))
-                        all_chinese.append(str(zh))
-            wb.close()
-        except Exception as e:
-            print(f"读取文件 {path} 出错: {e}")
-    return all_korean, all_chinese
+def dedupe_repeated_cjk(text):
+    if not isinstance(text, str) or not text:
+        return text
+    s = text
+    for n in range(1, 7):
+        s = re.sub(rf"([\u4e00-\u9fa5]{{{n}}})(?:\1)+", r"\1", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
 
 
-class TranslationIdDataset(Dataset):
-    def __init__(self, ko_ids: list[list[int]], zh_ids: list[list[int]]):
-        self.ko_ids = ko_ids
-        self.zh_ids = zh_ids
+def load_user_dict(md_path):
+    token_overrides = {}
+    direct_translations = {}
+    replace_rules = {}
+    glossary = {}
+    model_only_terms = set()
 
-    def __len__(self):
-        return len(self.ko_ids)
+    if not os.path.exists(md_path):
+        return token_overrides, direct_translations, replace_rules, glossary, model_only_terms
 
-    def __getitem__(self, idx):
-        return torch.LongTensor(self.ko_ids[idx]), torch.LongTensor(self.zh_ids[idx])
+    section = "glossary"
+    with open(md_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("##"):
+                header = line.lstrip("#").strip()
+                if "分词" in header:
+                    section = "tokenize"
+                elif "直译" in header:
+                    section = "translate"
+                elif "替换" in header:
+                    section = "replace"
+                elif "术语" in header:
+                    section = "glossary"
+                else:
+                    section = None
+                continue
+            if line.startswith("#"):
+                header = line.lstrip("#").strip()
+                if "术语" in header:
+                    section = "glossary"
+                continue
+            if not line.startswith("- "):
+                continue
+            content = line[2:]
+            sep_pos_ascii = content.find(":")
+            sep_pos_full = content.find("：")
+            sep_positions = [p for p in (sep_pos_ascii, sep_pos_full) if p != -1]
+            if not sep_positions:
+                only_ko = clean_text(content.strip())
+                if only_ko:
+                    model_only_terms.add(only_ko)
+                    model_only_terms.add(content.strip())
+                    if only_ko not in glossary:
+                        glossary[only_ko] = ""
+                    raw_ko = content.strip()
+                    if raw_ko and raw_ko != only_ko and raw_ko not in glossary:
+                        glossary[raw_ko] = ""
+                continue
 
+            sep_pos = min(sep_positions)
+            left, right = content[:sep_pos], content[sep_pos + 1 :]
+            left = left.strip()
+            right = right.strip()
+            if not left or not right:
+                continue
 
-def collate_fn(batch):
-    ko_batch, zh_batch = zip(*batch)
-    ko_lens = [int(x.numel()) for x in ko_batch]
-    zh_lens = [int(x.numel()) for x in zh_batch]
-    ko_padded = nn.utils.rnn.pad_sequence(ko_batch, padding_value=0)
-    zh_padded = nn.utils.rnn.pad_sequence(zh_batch, padding_value=0)
-    return ko_padded, ko_lens, zh_padded, zh_lens
+            if section == "tokenize":
+                token_overrides[clean_text(left)] = [t for t in right.split() if t]
+            elif section == "translate":
+                direct_translations[clean_text(left)] = right
+            elif section == "replace":
+                replace_rules[left] = right
+            elif section == "glossary":
+                parts = [p.strip() for p in re.split(r"[:：]", right) if p.strip()]
+                if len(parts) >= 2:
+                    wrong_zh = parts[0]
+                    correct_zh = parts[1]
+                else:
+                    wrong_zh = parts[0]
+                    correct_zh = parts[0]
 
+                ko_term = left
+                glossary[ko_term] = correct_zh
+                ko_term_clean = clean_text(ko_term)
+                if ko_term_clean and ko_term_clean != ko_term:
+                    glossary[ko_term_clean] = correct_zh
 
-def train_sentencepiece_models(
-    ko_sents: list[str],
-    zh_sents: list[str],
-    model_folder: str,
-    vocab_size: int,
-    ko_prefix_name: str = "spm_ko_v3_2_1",
-    zh_prefix_name: str = "spm_zh_v3_2_1",
-) -> tuple[str, str]:
-    model_folder = str(model_folder)
-    ko_prefix = os.path.join(model_folder, ko_prefix_name)
-    zh_prefix = os.path.join(model_folder, zh_prefix_name)
-    ko_model_path = f"{ko_prefix}.model"
-    zh_model_path = f"{zh_prefix}.model"
+                if wrong_zh:
+                    replace_rules[wrong_zh] = correct_zh
 
-    if os.path.exists(ko_model_path) and os.path.exists(zh_model_path):
-        print(f"检测到已存在 SentencePiece 模型，直接复用: {model_folder}", flush=True)
-        return ko_model_path, zh_model_path
-
-    if spm is None:
-        raise RuntimeError(f"未安装 sentencepiece，错误: {spm_import_error}")
-
-    os.makedirs(model_folder, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ko_txt = os.path.join(tmpdir, "ko.txt")
-        zh_txt = os.path.join(tmpdir, "zh.txt")
-
-        print("正在写入 SentencePiece 训练文本（ko/zh）...", flush=True)
-        with open(ko_txt, "w", encoding="utf-8") as f:
-            for s in ko_sents:
-                f.write((s or "").replace("\n", " ") + "\n")
-
-        with open(zh_txt, "w", encoding="utf-8") as f:
-            for s in zh_sents:
-                f.write((s or "").replace("\n", " ") + "\n")
-        print("SentencePiece 训练文本写入完成。", flush=True)
-
-        print(f"开始训练 SentencePiece(ko) vocab_size={vocab_size} ...", flush=True)
-        spm.SentencePieceTrainer.Train(
-            input=ko_txt,
-            model_prefix=ko_prefix,
-            vocab_size=vocab_size,
-            model_type="bpe",
-            pad_id=0,
-            bos_id=1,
-            eos_id=2,
-            unk_id=3,
-        )
-        print("SentencePiece(ko) 完成。", flush=True)
-
-        print(f"开始训练 SentencePiece(zh) vocab_size={vocab_size} ...", flush=True)
-        spm.SentencePieceTrainer.Train(
-            input=zh_txt,
-            model_prefix=zh_prefix,
-            vocab_size=vocab_size,
-            model_type="bpe",
-            pad_id=0,
-            bos_id=1,
-            eos_id=2,
-            unk_id=3,
-        )
-        print("SentencePiece(zh) 完成。", flush=True)
-
-    return ko_model_path, zh_model_path
-
-
-def encode_with_spm(sentences: list[str], sp) -> list[list[int]]:
-    bos = int(sp.bos_id())
-    eos = int(sp.eos_id())
-    all_ids: list[list[int]] = []
-    for s in sentences:
-        piece_ids = sp.encode(s, out_type=int)
-        all_ids.append([bos] + piece_ids + [eos])
-    return all_ids
+    return token_overrides, direct_translations, replace_rules, glossary, model_only_terms
 
 
+def apply_replacements(text, replace_rules):
+    if not replace_rules:
+        return text
+    for src, dst in replace_rules.items():
+        if src:
+            text = text.replace(src, dst)
+    return text
+
+
+# --- 2. 模型定义 (必须与 V3.0 训练代码完全一致) ---
 class Attention(nn.Module):
-    def __init__(self, hid_dim: int):
+    def __init__(self, hid_dim):
         super().__init__()
         self.attn = nn.Linear((hid_dim * 2) + hid_dim, hid_dim)
         self.v = nn.Linear(hid_dim, 1, bias=False)
 
     def forward(self, hidden, encoder_outputs):
+        batch_size = encoder_outputs.shape[1]
         src_len = encoder_outputs.shape[0]
         hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
         encoder_outputs = encoder_outputs.permute(1, 0, 2)
@@ -300,21 +232,14 @@ class Attention(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim: int, emb_dim: int, hid_dim: int, n_layers: int, dropout: float):
+    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
         super().__init__()
         self.embedding = nn.Embedding(input_dim, emb_dim)
-        rnn_dropout = float(dropout) if int(n_layers) > 1 else 0.0
-        self.rnn = nn.GRU(emb_dim, hid_dim, n_layers, bidirectional=True, dropout=rnn_dropout)
+        self.rnn = nn.GRU(emb_dim, hid_dim, n_layers, bidirectional=True, dropout=dropout)
         self.fc = nn.Linear(hid_dim * 2, hid_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, src, src_len):
-        if src_len is None:
-            src_len = (src != 0).long().sum(dim=0).to(device="cpu")
-        elif isinstance(src_len, list):
-            src_len = torch.tensor(src_len, dtype=torch.long, device="cpu")
-        else:
-            src_len = src_len.to(device="cpu", dtype=torch.long)
         embedded = self.dropout(self.embedding(src))
         packed = nn.utils.rnn.pack_padded_sequence(embedded, src_len, enforce_sorted=False)
         outputs, hidden = self.rnn(packed)
@@ -324,14 +249,12 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, output_dim: int, emb_dim: int, hid_dim: int, n_layers: int, dropout: float, attention):
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout, attention):
         super().__init__()
         self.output_dim = output_dim
-        self.n_layers = int(n_layers)
         self.attention = attention
         self.embedding = nn.Embedding(output_dim, emb_dim)
-        rnn_dropout = float(dropout) if int(n_layers) > 1 else 0.0
-        self.rnn = nn.GRU((hid_dim * 2) + emb_dim, hid_dim, n_layers, dropout=rnn_dropout)
+        self.rnn = nn.GRU((hid_dim * 2) + emb_dim, hid_dim, n_layers, dropout=dropout)
         self.fc_out = nn.Linear((hid_dim * 2) + hid_dim + emb_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -342,15 +265,12 @@ class Decoder(nn.Module):
         encoder_outputs = encoder_outputs.permute(1, 0, 2)
         weighted = torch.bmm(a, encoder_outputs).permute(1, 0, 2)
         rnn_input = torch.cat((embedded, weighted), dim=2)
-        hidden_for_rnn = hidden.unsqueeze(0)
-        if self.n_layers > 1:
-            hidden_for_rnn = hidden_for_rnn.repeat(self.n_layers, 1, 1)
-        output, hidden = self.rnn(rnn_input, hidden_for_rnn)
+        output, hidden = self.rnn(rnn_input, hidden.unsqueeze(0))
         embedded = embedded.squeeze(0)
         output = output.squeeze(0)
         weighted = weighted.squeeze(0)
         prediction = self.fc_out(torch.cat((output, weighted, embedded), dim=1))
-        return prediction, hidden[-1]
+        return prediction, hidden.squeeze(0)
 
 
 class Seq2Seq(nn.Module):
@@ -360,439 +280,367 @@ class Seq2Seq(nn.Module):
         self.decoder = decoder
         self.device = device
 
-    def forward(self, src, src_len, trg, teacher_forcing_ratio: float = 0.5):
+    def forward(self, src, src_len, trg, teacher_forcing_ratio=0):
         batch_size = src.shape[1]
         trg_len = trg.shape[0]
         trg_vocab_size = self.decoder.output_dim
         outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)
-        src_len = (src != 0).long().sum(dim=0).to(device="cpu")
         encoder_outputs, hidden = self.encoder(src, src_len)
         input = trg[0, :]
         for t in range(1, trg_len):
             output, hidden = self.decoder(input, hidden, encoder_outputs)
             outputs[t] = output
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
             top1 = output.argmax(1)
-            input = trg[t] if teacher_force else top1
+            input = top1
         return outputs
 
 
-def unwrap_model(model: nn.Module) -> nn.Module:
-    if isinstance(model, nn.DataParallel):
-        return model.module
-    return model
+# --- 3. 翻译函数 ---
+def tokenize_for_display(text):
+    if not isinstance(text, str) or not text.strip():
+        return []
+    tokens = []
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9/_\-]*|[\uAC00-\uD7A3]+|\d+(?:\.\d+)?%?", text):
+        tokens.append(m.group(0))
+    return tokens
 
 
-def load_state_dict_safely(model: nn.Module, state_dict: dict) -> None:
-    model_obj = unwrap_model(model)
+_okt = None
+
+
+def tokenize_ko_for_model(text):
+    s = clean_text(text)
+    if not s:
+        return []
     try:
-        model_obj.load_state_dict(state_dict)
-        return
-    except RuntimeError:
-        pass
-    if any(k.startswith("module.") for k in state_dict.keys()):
-        stripped = {k[len("module.") :]: v for k, v in state_dict.items()}
-        model_obj.load_state_dict(stripped)
-        return
-    prefixed = {f"module.{k}": v for k, v in state_dict.items()}
-    model_obj.load_state_dict(prefixed)
+        global _okt
+        if _okt is None:
+            from konlpy.tag import Okt
+
+            _okt = Okt()
+        return _okt.morphs(s)
+    except Exception:
+        return s.split()
 
 
-def train_model_bpe(
-    train_loader,
-    test_loader,
-    ko_sp,
-    zh_sp,
-    device: torch.device,
-    model_folder: str,
-    max_epochs: int,
-    lr: float,
-    use_multi_gpu: bool,
-    use_amp: bool,
-    grad_accum_steps: int,
-    log_every: int,
-    show_samples: int,
-    teacher_forcing_ratio: float,
-    dropout: float,
-    weight_decay: float,
-    lr_factor: float,
-    lr_patience: int,
-    lr_min: float,
-    early_stop_patience: int,
-    resume_mode: str,
-):
-    input_dim = ko_sp.get_piece_size()
-    output_dim = zh_sp.get_piece_size()
-
-    enc_emb_dim = 256
-    dec_emb_dim = 256
-    hid_dim = 512
-    n_layers = 2
-    dropout = float(dropout)
-
-    attn = Attention(hid_dim)
-    enc = Encoder(input_dim, enc_emb_dim, hid_dim, n_layers, dropout).to(device)
-    dec = Decoder(output_dim, dec_emb_dim, hid_dim, n_layers, dropout, attn).to(device)
-    model = Seq2Seq(enc, dec, device).to(device)
-
-    if device.type == "cuda" and use_multi_gpu and torch.cuda.device_count() >= 2:
-        model = nn.DataParallel(model, dim=1)
-
-    optimizer = optim.Adam(unwrap_model(model).parameters(), lr=float(lr), weight_decay=float(weight_decay))
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=float(lr_factor),
-        patience=int(lr_patience),
-        min_lr=float(lr_min),
-    )
-
-    os.makedirs(model_folder, exist_ok=True)
-    best_state_path = os.path.join(model_folder, "best_model_v3_2_1_bpe_attn.pth")
-    best_ckpt_path = os.path.join(model_folder, "best_model_v3_2_1_bpe_attn.ckpt")
-
-    start_epoch = 0
-    best_test_loss = float("inf")
-    patience = int(early_stop_patience)
-    no_improve = 0
-
-    if hasattr(torch, "amp"):
-        scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and use_amp))
-    else:
-        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and use_amp))
-
-    if os.path.exists(best_ckpt_path):
-        ckpt = torch.load(best_ckpt_path, map_location="cpu")
-        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            if resume_mode == "model" and os.path.exists(best_state_path):
-                load_state_dict_safely(model, torch.load(best_state_path, map_location="cpu"))
-            else:
-                load_state_dict_safely(model, ckpt["model_state_dict"])
-            if resume_mode == "full":
-                if "optimizer_state_dict" in ckpt:
-                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                if "scheduler_state_dict" in ckpt:
-                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                if "scaler_state_dict" in ckpt and scaler.is_enabled():
-                    scaler.load_state_dict(ckpt["scaler_state_dict"])
-            start_epoch = 0 if resume_mode == "model" else int(ckpt.get("epoch", 0))
-            best_test_loss = float(ckpt.get("best_test_loss", best_test_loss))
-            no_improve = 0 if resume_mode == "model" else int(ckpt.get("no_improve", 0))
-            print(f"检测到已存在的 BPE Checkpoint，继续训练: {best_ckpt_path}")
-            if resume_mode == "model":
-                print("Resume Mode = model：从 best 权重开始精调（优化器/调度器重置，epoch 从 1 重新计）", flush=True)
-
-    grad_accum_steps = max(1, int(grad_accum_steps))
-    log_every = max(1, int(log_every))
-    show_samples = max(0, int(show_samples))
-    teacher_forcing_ratio = float(teacher_forcing_ratio)
-    teacher_forcing_ratio = max(0.0, min(1.0, teacher_forcing_ratio))
-    pad_id = 0
-    eos_id = int(zh_sp.eos_id())
-    unk_id = int(zh_sp.unk_id())
-
-    for epoch in range(start_epoch, max_epochs):
-        print(f"Epoch {epoch+1}/{max_epochs} 开始...", flush=True)
-        model.train()
-        epoch_loss = 0.0
-        optimizer.zero_grad(set_to_none=True)
-
-        for i, (src, src_len, trg, trg_len) in enumerate(train_loader):
-            src = src.to(device, non_blocking=True)
-            trg = trg.to(device, non_blocking=True)
-
-            autocast_ctx = (
-                torch.amp.autocast("cuda", enabled=use_amp)
-                if (device.type == "cuda" and hasattr(torch, "amp"))
-                else (torch.cuda.amp.autocast(enabled=use_amp) if device.type == "cuda" else nullcontext())
-            )
-            with autocast_ctx:
-                output = model(src, src_len, trg, teacher_forcing_ratio=teacher_forcing_ratio)
-                vocab_size = output.shape[-1]
-                output = output[1:].reshape(-1, vocab_size)
-                trg_flat = trg[1:].reshape(-1)
-                loss = criterion(output, trg_flat) / grad_accum_steps
-
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            epoch_loss += float(loss.item()) * grad_accum_steps
-
-            if (i + 1) % grad_accum_steps == 0:
-                if scaler.is_enabled():
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(unwrap_model(model).parameters(), 1.0)
-                if scaler.is_enabled():
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            if (i + 1) % log_every == 0:
-                current_loss = float(loss.item()) * grad_accum_steps
-                print(f"Epoch: {epoch+1:02}, Batch: {i+1}/{len(train_loader)}, Loss: {current_loss:.4f}", flush=True)
-
-        model.eval()
-        test_loss = 0.0
-        correct_tokens = 0
-        total_tokens = 0
-        unk_tokens = 0
-        exact_match = 0
-        total_seqs = 0
-        pred_len_sum = 0
-        trg_len_sum = 0
-        shown = 0
+def _decode_greedy(model, encoder_outputs, hidden, zh_vocab, device, max_len=50, repeat_penalty=1.2):
+    inv_zh_vocab = {v: k for k, v in zh_vocab.items()}
+    trg_indices = [zh_vocab["<sos>"]]
+    for _ in range(max_len):
+        trg_tensor = torch.LongTensor([trg_indices[-1]]).to(device)
         with torch.no_grad():
-            for src, src_len, trg, trg_len in test_loader:
-                src = src.to(device, non_blocking=True)
-                trg = trg.to(device, non_blocking=True)
-                autocast_ctx = (
-                    torch.amp.autocast("cuda", enabled=use_amp)
-                    if (device.type == "cuda" and hasattr(torch, "amp"))
-                    else (torch.cuda.amp.autocast(enabled=use_amp) if device.type == "cuda" else nullcontext())
+            output, hidden = model.decoder(trg_tensor, hidden, encoder_outputs)
+        logits = output.squeeze(0)
+        if repeat_penalty and repeat_penalty > 1.0:
+            for tid in set(trg_indices[1:]):
+                logits[tid] = logits[tid] / repeat_penalty
+        top1 = logits.argmax(0).item()
+        trg_indices.append(top1)
+        if top1 == zh_vocab["<eos>"]:
+            break
+    translated_tokens = [inv_zh_vocab.get(idx, "<unk>") for idx in trg_indices]
+    translated_tokens = [t for t in translated_tokens if t not in ["<sos>", "<eos>", "<pad>"]]
+    return translated_tokens
+
+
+def translate_seq2seq_sentence_level(text, model, ko_vocab, zh_vocab, device, max_len=50, repeat_penalty=1.2):
+    tokens = tokenize_ko_for_model(text)
+    if not tokens:
+        return "", 0.0
+    unk_idx = ko_vocab.get("<unk>", 3)
+    indices = [ko_vocab["<sos>"]] + [ko_vocab.get(t, unk_idx) for t in tokens] + [ko_vocab["<eos>"]]
+    src_tensor = torch.LongTensor(indices).unsqueeze(1).to(device)
+    src_len = torch.LongTensor([len(indices)])
+
+    with torch.no_grad():
+        encoder_outputs, hidden = model.encoder(src_tensor, src_len)
+    translated_tokens = _decode_greedy(
+        model,
+        encoder_outputs,
+        hidden,
+        zh_vocab,
+        device,
+        max_len=max_len,
+        repeat_penalty=repeat_penalty,
+    )
+    if not translated_tokens:
+        return "", 1.0
+    unk_ratio = translated_tokens.count("<unk>") / max(1, len(translated_tokens))
+    out = "".join([t for t in translated_tokens if t != "<unk>"]).strip()
+    return out, unk_ratio
+
+
+SIMPLE_PARTICLES = {"이", "의", "는", "를"}
+
+
+def split_simple_particle(token):
+    if not isinstance(token, str) or len(token) <= 1:
+        return [token]
+    if not re.fullmatch(r"[\uAC00-\uD7A3]+", token):
+        return [token]
+    last = token[-1]
+    if last in SIMPLE_PARTICLES and len(token) > 1:
+        return [token[:-1], last]
+    return [token]
+
+
+def split_by_user_terms(token, user_dict, max_pieces=4):
+    if not isinstance(token, str) or len(token) <= 1:
+        return [token]
+    if not re.fullmatch(r"[\uAC00-\uD7A3]+", token):
+        return [token]
+    token_overrides, direct_translations, _, glossary, model_only_terms = user_dict
+    known_terms = set()
+    for k in glossary.keys():
+        ck = clean_text(k)
+        if ck:
+            known_terms.add(ck)
+    for k in direct_translations.keys():
+        ck = clean_text(k)
+        if ck:
+            known_terms.add(ck)
+    for k in token_overrides.keys():
+        ck = clean_text(k)
+        if ck:
+            known_terms.add(ck)
+    for k in model_only_terms:
+        ck = clean_text(k)
+        if ck:
+            known_terms.add(ck)
+
+    s = clean_text(token)
+    if s in known_terms:
+        return [token]
+
+    best_prefix = None
+    for j in range(len(s), 1, -1):
+        cand = s[:j]
+        if len(cand) >= 2 and cand in known_terms:
+            best_prefix = cand
+            break
+
+    if not best_prefix:
+        return [token]
+
+    remainder = s[len(best_prefix) :]
+    if not remainder:
+        return [best_prefix]
+    return [best_prefix, remainder]
+
+
+def translate_korean_token(token, model, ko_vocab, zh_vocab, device, user_dict, cache, max_len=20, repeat_penalty=1.2):
+    token_overrides, direct_translations, replace_rules, glossary, model_only_terms = user_dict
+    key = clean_text(token)
+    if not key:
+        return ""
+    if key in cache:
+        return cache[key]
+
+    if not (model_only_terms and key in model_only_terms) and key in direct_translations:
+        out = apply_replacements(direct_translations[key], replace_rules)
+        cache[key] = out
+        return out
+    if not (model_only_terms and key in model_only_terms) and key in glossary and glossary.get(key):
+        out = apply_replacements(glossary[key], replace_rules)
+        cache[key] = out
+        return out
+
+    if key in token_overrides:
+        parts = token_overrides[key]
+        out = "".join(
+            [
+                translate_korean_token(
+                    p, model, ko_vocab, zh_vocab, device, user_dict, cache, max_len=max_len, repeat_penalty=repeat_penalty
                 )
-                with autocast_ctx:
-                    output = model(src, src_len, trg, 0.0)
-                    vocab_size = output.shape[-1]
-                    output = output[1:].reshape(-1, vocab_size)
-                    trg_flat = trg[1:].reshape(-1)
-                    loss = criterion(output, trg_flat)
-                test_loss += float(loss.item())
-
-                pred = output.reshape(-1, vocab_size).argmax(dim=1).reshape(trg.shape[0] - 1, trg.shape[1])
-                trg_tokens = trg[1:]
-                mask = trg_tokens != pad_id
-                correct = (pred == trg_tokens) & mask
-                correct_tokens += int(correct.sum().item())
-                total_tokens += int(mask.sum().item())
-                unk_tokens += int(((pred == unk_id) & mask).sum().item())
-                exact_match += int((correct.sum(dim=0) == mask.sum(dim=0)).sum().item())
-                total_seqs += int(trg.shape[1])
-
-                if show_samples and shown < show_samples:
-                    bsz = int(trg.shape[1])
-                    for bi in range(bsz):
-                        if shown >= show_samples:
-                            break
-                        pred_seq = pred[:, bi].tolist()
-                        trg_seq = trg_tokens[:, bi].tolist()
-                        if eos_id in pred_seq:
-                            pred_seq = pred_seq[: pred_seq.index(eos_id)]
-                        if eos_id in trg_seq:
-                            trg_seq = trg_seq[: trg_seq.index(eos_id)]
-                        pred_text = zh_sp.decode(pred_seq) if pred_seq else ""
-                        trg_text = zh_sp.decode(trg_seq) if trg_seq else ""
-                        print(f"SAMPLE_PRED: {pred_text}", flush=True)
-                        print(f"SAMPLE_GOLD: {trg_text}", flush=True)
-                        shown += 1
-
-                for bi in range(int(trg.shape[1])):
-                    trg_seq = trg_tokens[:, bi]
-                    trg_valid = int((trg_seq != pad_id).sum().item())
-                    trg_len_sum += trg_valid
-                    pred_seq = pred[:, bi]
-                    if (pred_seq == eos_id).any():
-                        pred_len = int((pred_seq == eos_id).float().argmax(dim=0).item())
-                        pred_len_sum += max(1, pred_len)
-                    else:
-                        pred_len_sum += max(1, trg_valid)
-
-        avg_train_loss = epoch_loss / max(1, len(train_loader))
-        avg_test_loss = test_loss / max(1, len(test_loader))
-        lr_now = float(optimizer.param_groups[0]["lr"])
-        ppl = math.exp(min(20.0, avg_test_loss))
-        acc = (correct_tokens / total_tokens) if total_tokens else 0.0
-        unk_rate = (unk_tokens / total_tokens) if total_tokens else 0.0
-        em = (exact_match / total_seqs) if total_seqs else 0.0
-        len_ratio = (pred_len_sum / trg_len_sum) if trg_len_sum else 0.0
-        print(
-            f"Epoch: {epoch+1:02} | Train Loss: {avg_train_loss:.4f} | Test Loss: {avg_test_loss:.4f} | PPL: {ppl:.2f} | Acc: {acc:.3f} | EM: {em:.3f} | UNK: {unk_rate:.3f} | LenRatio: {len_ratio:.3f} | LR: {lr_now:.6f}",
-            flush=True,
+                for p in parts
+            ]
         )
+        cache[key] = out
+        return out
 
-        scheduler.step(avg_test_loss)
+    unk_idx = ko_vocab.get("<unk>", 3)
+    indices = [ko_vocab["<sos>"], ko_vocab.get(key, unk_idx), ko_vocab["<eos>"]]
+    src_tensor = torch.LongTensor(indices).unsqueeze(1).to(device)
+    src_len = torch.LongTensor([len(indices)])
 
-        state = {
-            "epoch": epoch + 1,
-            "model_state_dict": unwrap_model(model).state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict() if scaler.is_enabled() else None,
-            "best_test_loss": best_test_loss,
-            "no_improve": no_improve,
-            "ko_spm_model": os.path.join(model_folder, "spm_ko_v3_2_1.model"),
-            "zh_spm_model": os.path.join(model_folder, "spm_zh_v3_2_1.model"),
-            "multi_gpu": bool(isinstance(model, nn.DataParallel)),
-        }
+    with torch.no_grad():
+        encoder_outputs, hidden = model.encoder(src_tensor, src_len)
 
-        if avg_test_loss < best_test_loss:
-            best_test_loss = avg_test_loss
-            no_improve = 0
-            torch.save(unwrap_model(model).state_dict(), best_state_path)
-            state["best_test_loss"] = best_test_loss
-            state["no_improve"] = no_improve
-            torch.save(state, best_ckpt_path)
-            print("  -> 测试损失下降，保存最佳模型与训练状态！", flush=True)
+    translated_tokens = _decode_greedy(
+        model,
+        encoder_outputs,
+        hidden,
+        zh_vocab,
+        device,
+        max_len=max_len,
+        repeat_penalty=repeat_penalty,
+    )
+    out = "".join([t for t in translated_tokens if t not in ["<sos>", "<eos>", "<pad>"]])
+    out = apply_replacements(out, replace_rules)
+    if not out.strip():
+        out = "<unk>"
+    cache[key] = out
+    return out
+
+
+def translate_mixed_text_word_by_word(text, model, ko_vocab, zh_vocab, device, user_dict, cache):
+    if not isinstance(text, str) or not text:
+        return ""
+    out = []
+    for piece in re.findall(r"\s+|[A-Za-z][A-Za-z0-9/_\-\.\+]*|\d+(?:\.\d+)?%?|[\uAC00-\uD7A3]+|.", text):
+        if not piece:
+            continue
+        if re.fullmatch(r"[\uAC00-\uD7A3]+", piece):
+            for p1 in split_by_user_terms(piece, user_dict):
+                for t in split_simple_particle(p1):
+                    if t:
+                        out.append(translate_korean_token(t, model, ko_vocab, zh_vocab, device, user_dict, cache))
         else:
-            no_improve += 1
-            state["no_improve"] = no_improve
-            torch.save(state, best_ckpt_path)
-            if no_improve >= patience:
-                print("早停触发，训练结束。", flush=True)
-                break
-
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    torch.save(unwrap_model(model).state_dict(), os.path.join(model_folder, f"model_v3_2_1_{timestamp}.pth"))
-    print("训练全过程完成！", flush=True)
+            out.append(piece)
+    return "".join(out)
 
 
-def resolve_default_model_dir() -> str:
-    if Path("/kaggle").exists():
-        return str(Path("/kaggle/working/Translate Model/v3_2_1"))
-    return "Translate Model/v3_2_1"
+def _extract_tokens_for_model(text):
+    return tokenize_ko_for_model(text)
 
 
-def set_seed(seed: int) -> None:
-    seed = int(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def translate_with_preserved_spans(text, model, ko_vocab, zh_vocab, device, user_dict, cache, max_len=50, repeat_penalty=1.2):
+    if not isinstance(text, str) or not text:
+        return ""
+    cleaned = clean_text(text)
+    if not cleaned:
+        return ""
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--inputs",
-        nargs="+",
-        default=[str(Path("/kaggle/input"))],
+    seq2seq_out, unk_ratio = translate_seq2seq_sentence_level(
+        cleaned, model, ko_vocab, zh_vocab, device, max_len=max_len, repeat_penalty=repeat_penalty
     )
-    parser.add_argument("--model_dir", default=resolve_default_model_dir())
-    parser.add_argument("--vocab_size", type=int, default=16000)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=0.0005)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--teacher_forcing", type=float, default=0.3)
-    parser.add_argument("--lr_factor", type=float, default=0.5)
-    parser.add_argument("--lr_patience", type=int, default=2)
-    parser.add_argument("--lr_min", type=float, default=1e-6)
-    parser.add_argument("--early_stop_patience", type=int, default=10)
-    parser.add_argument("--resume_mode", choices=["full", "model"], default="model")
-    parser.add_argument("--test_size", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=min(4, (os.cpu_count() or 2)))
-    parser.add_argument("--no_amp", action="store_true")
-    parser.add_argument("--no_multi_gpu", action="store_true")
-    parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--show_samples", type=int, default=0)
-    args, unknown = parser.parse_known_args()
-    if unknown:
-        print(f"忽略额外参数: {unknown}", flush=True)
+    if seq2seq_out and unk_ratio <= 0.5:
+        return seq2seq_out
+    return translate_mixed_text_word_by_word(cleaned, model, ko_vocab, zh_vocab, device, user_dict, cache)
 
-    if spm is None:
-        raise RuntimeError(f"缺少 sentencepiece，错误: {spm_import_error}")
 
-    set_seed(args.seed)
+def translate_sentence(sentence, model, ko_vocab, zh_vocab, device, user_dict, max_len=50, show_tokens=True):
+    model.eval()
+    token_overrides, direct_translations, replace_rules, glossary, model_only_terms = user_dict
+    original_raw_sentence = sentence if isinstance(sentence, str) else ""
+    raw_sentence = original_raw_sentence.strip()
+    sentence_key = clean_text(raw_sentence)
 
-    file_paths = find_excel_files(args.inputs)
-    if not file_paths:
-        raise RuntimeError(f"未找到任何 xlsx 文件，inputs={args.inputs}")
-    print(f"发现 xlsx 文件数量: {len(file_paths)}", flush=True)
+    if show_tokens:
+        print(f"分词结果(显示): {tokenize_for_display(raw_sentence)}")
+        print(f"分词结果(送模型token): {_extract_tokens_for_model(raw_sentence)}")
 
-    print("开始读取语料...", flush=True)
-    ko_sents, zh_sents = read_corpus(file_paths)
-    ko_sents = [clean_text(s) for s in ko_sents]
-    zh_sents = [clean_text(s) for s in zh_sents]
-    nonempty = [(k, z) for k, z in zip(ko_sents, zh_sents) if k and z]
-    ko_sents = [k for k, _ in nonempty]
-    zh_sents = [z for _, z in nonempty]
-    print(f"读取完成，句对数量: {len(ko_sents)}", flush=True)
+    cache = {}
 
-    print("开始准备 SentencePiece（复用或训练）...", flush=True)
-    ko_model_path, zh_model_path = train_sentencepiece_models(
-        ko_sents,
-        zh_sents,
-        args.model_dir,
-        vocab_size=int(args.vocab_size),
-    )
-    ko_sp = spm.SentencePieceProcessor(model_file=ko_model_path)
-    zh_sp = spm.SentencePieceProcessor(model_file=zh_model_path)
-
-    ko_ids = encode_with_spm(ko_sents, ko_sp)
-    zh_ids = encode_with_spm(zh_sents, zh_sp)
-    print("BPE 编码完成。", flush=True)
-
-    ko_train, ko_test, zh_train, zh_test = train_test_split(
-        ko_ids,
-        zh_ids,
-        test_size=float(args.test_size),
-        random_state=int(args.seed),
-    )
-
-    train_ds = TranslationIdDataset(ko_train, zh_train)
-    test_ds = TranslationIdDataset(ko_test, zh_test)
-    print(f"训练集: {len(train_ds)} | 测试集: {len(test_ds)}", flush=True)
-
-    pin_memory = torch.cuda.is_available()
-    persistent_workers = bool(args.num_workers and args.num_workers > 0)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=int(args.batch_size),
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=int(args.num_workers),
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=int(args.batch_size),
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=int(args.num_workers),
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        gpu_count = torch.cuda.device_count()
-        print(f"使用设备: {device} | GPU 数量: {gpu_count}", flush=True)
+    translated_text = ""
+    if not (model_only_terms and sentence_key in model_only_terms) and sentence_key in direct_translations:
+        translated_text = direct_translations[sentence_key]
+    elif not (model_only_terms and sentence_key in model_only_terms) and sentence_key in glossary and glossary.get(sentence_key):
+        translated_text = glossary[sentence_key]
     else:
-        print(f"使用设备: {device}", flush=True)
+        parts = split_by_parentheses(raw_sentence)
+        if isinstance(raw_sentence, str) and len(parts) > 1:
+            out = []
+            for p in parts:
+                if p.startswith("(") and p.endswith(")"):
+                    if re.fullmatch(r"\(\s*\d+\s*\)", p):
+                        out.append(p)
+                        continue
+                    inner = p[1:-1]
+                    inner_translated = translate_sentence(
+                        inner, model, ko_vocab, zh_vocab, device, user_dict, max_len=max_len, show_tokens=False
+                    )
+                    out.append(f"({inner_translated})")
+                    continue
+                if p.startswith("（") and p.endswith("）"):
+                    if re.fullmatch(r"（\s*\d+\s*）", p):
+                        out.append(p)
+                        continue
+                    inner = p[1:-1]
+                    inner_translated = translate_sentence(
+                        inner, model, ko_vocab, zh_vocab, device, user_dict, max_len=max_len, show_tokens=False
+                    )
+                    out.append(f"（{inner_translated}）")
+                    continue
 
-    train_model_bpe(
-        train_loader=train_loader,
-        test_loader=test_loader,
-        ko_sp=ko_sp,
-        zh_sp=zh_sp,
-        device=device,
-        model_folder=str(args.model_dir),
-        max_epochs=int(args.epochs),
-        lr=float(args.lr),
-        use_multi_gpu=(not args.no_multi_gpu),
-        use_amp=(not args.no_amp),
-        grad_accum_steps=int(args.grad_accum_steps),
-        log_every=int(args.log_every),
-        show_samples=int(args.show_samples),
-        teacher_forcing_ratio=float(args.teacher_forcing),
-        dropout=float(args.dropout),
-        weight_decay=float(args.weight_decay),
-        lr_factor=float(args.lr_factor),
-        lr_patience=int(args.lr_patience),
-        lr_min=float(args.lr_min),
-        early_stop_patience=int(args.early_stop_patience),
-        resume_mode=str(args.resume_mode),
-    )
+                out.append(
+                    translate_with_preserved_spans(
+                        p, model, ko_vocab, zh_vocab, device, user_dict, cache, max_len=max_len, repeat_penalty=1.2
+                    )
+                )
+            translated_text = "".join(out)
+        else:
+            translated_text = translate_with_preserved_spans(
+                raw_sentence, model, ko_vocab, zh_vocab, device, user_dict, cache, max_len=max_len, repeat_penalty=1.2
+            )
+
+    translated_text = apply_replacements(translated_text, replace_rules)
+    translated_text = dedupe_repeated_cjk(translated_text)
+    return translated_text
 
 
+# --- 4. 主程序 ---
 if __name__ == "__main__":
-    main()
+    device = torch.device("cpu")
+    model_dir = r"D:\PythonProject\Translate Model\V3.0(Attention)\20260527-best Model\epoch03-4.4666"
+    model_dir = os.path.normpath(str(model_dir).strip().strip('"').strip("'"))
+    user_dict_path = os.path.join(os.path.dirname(__file__), "user_dict.md")
 
+    model_path = os.path.join(model_dir, "best_model_v3_0_1_attn.pth")
+    ko_vocab_path = os.path.join(model_dir, "best_ko_vocab_v3_0_1_attn.pkl")
+    zh_vocab_path = os.path.join(model_dir, "best_zh_vocab_v3_0_1_attn.pkl")
+
+    import glob
+
+    ko_vocabs = glob.glob(os.path.join(model_dir, "ko_vocab_v3_0_1_*.pkl"))
+    zh_vocabs = glob.glob(os.path.join(model_dir, "zh_vocab_v3_0_1_*.pkl"))
+    if ko_vocabs:
+        ko_vocab_path = max(ko_vocabs, key=os.path.getctime)
+    if zh_vocabs:
+        zh_vocab_path = max(zh_vocabs, key=os.path.getctime)
+
+    if not os.path.exists(model_path):
+        fallback = os.path.join(model_dir, "best_model_v3_attn.pth")
+        if os.path.exists(fallback):
+            model_path = fallback
+        else:
+            print(f"找不到模型文件: {model_path}，请先运行 V3.0.1 训练脚本。")
+    if not os.path.exists(ko_vocab_path) or not os.path.exists(zh_vocab_path):
+        fallback_ko = os.path.join(model_dir, "best_ko_vocab_v3_attn.pkl")
+        fallback_zh = os.path.join(model_dir, "best_zh_vocab_v3_attn.pkl")
+        if os.path.exists(fallback_ko) and os.path.exists(fallback_zh):
+            ko_vocab_path = fallback_ko
+            zh_vocab_path = fallback_zh
+        else:
+            print(f"找不到词汇表文件: {ko_vocab_path} / {zh_vocab_path}，请先运行 V3.0.1 训练脚本。")
+    else:
+        with open(ko_vocab_path, "rb") as f:
+            ko_vocab = pickle.load(f)
+        with open(zh_vocab_path, "rb") as f:
+            zh_vocab = pickle.load(f)
+
+        INPUT_DIM = len(ko_vocab)
+        OUTPUT_DIM = len(zh_vocab)
+        ENC_EMB_DIM = 256
+        DEC_EMB_DIM = 256
+        HID_DIM = 512
+        N_LAYERS = 1
+
+        attn = Attention(HID_DIM)
+        enc = Encoder(INPUT_DIM, ENC_EMB_DIM, HID_DIM, N_LAYERS, 0)
+        dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, HID_DIM, N_LAYERS, 0, attn)
+        model = Seq2Seq(enc, dec, device).to(device)
+
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print("V3.0.1 Attention 模型加载成功！")
+
+        while True:
+            sentence = input("\n请输入韩文 (输入 q 退出): ")
+            if sentence.lower() == "q":
+                break
+            if not sentence.strip():
+                continue
+
+            user_dict = load_user_dict(user_dict_path)
+            translation = translate_sentence(sentence, model, ko_vocab, zh_vocab, device, user_dict)
+            print(f"中文翻译: {translation}")
