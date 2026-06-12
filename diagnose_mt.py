@@ -46,6 +46,12 @@ def _configure_console_utf8():
         pass
 
 
+def _timestamped_score_output_path(prefix: str, base_dir: str | None = None) -> str:
+    out_dir = base_dir or r"D:\PythonProject\evaluate models performance"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(out_dir, f"{prefix}_{stamp}.xlsx")
+
+
 def _load_keywords_file(path: str):
     path = os.path.normpath(str(path).strip().strip('"').strip("'"))
     keywords = []
@@ -905,6 +911,31 @@ def _load_module_from_path(module_name: str, file_path: str):
     spec.loader.exec_module(module)
     return module
 
+
+def _load_module_without_gui_entry(module_name: str, file_path: str):
+    import types
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        source = f.read()
+
+    lines = source.splitlines()
+    cut_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s == "root = tk.Tk()" or s.startswith("root = tk.Tk("):
+            cut_idx = i
+            break
+
+    if cut_idx is None:
+        return _load_module_from_path(module_name, file_path)
+
+    partial_source = "\n".join(lines[:cut_idx]) + "\n"
+    module = types.ModuleType(module_name)
+    module.__file__ = file_path
+    module.__name__ = module_name
+    exec(compile(partial_source, file_path, "exec"), module.__dict__)
+    return module
+
 def _infer_model_paths(model_dir: str, prefer_tag: str | None = None):
     model_dir = os.path.normpath(str(model_dir).strip().strip('"').strip("'"))
     if not os.path.isdir(model_dir):
@@ -1111,8 +1142,8 @@ def eval_set_word(
     device = torch.device("cpu")
     input_dim = len(ko_vocab)
     output_dim = len(zh_vocab)
-    enc_emb_dim = 256
-    dec_emb_dim = 256
+    enc_emb_dim = 512
+    dec_emb_dim = 512
     hid_dim = 512
     n_layers = 1
 
@@ -1366,8 +1397,8 @@ def eval_set_bpe(
 
     input_dim = int(ko_sp.get_piece_size())
     output_dim = int(zh_sp.get_piece_size())
-    enc_emb_dim = 256
-    dec_emb_dim = 256
+    enc_emb_dim = 512
+    dec_emb_dim = 512
     hid_dim = 512
 
     if not all(hasattr(mod, x) for x in ("Attention", "Encoder", "Decoder", "Seq2Seq")):
@@ -1531,6 +1562,310 @@ def eval_set_bpe(
         print("\n已保存:", eval_out)
 
 
+def _resolve_v4_transformer_paths(model_dir: str) -> tuple[str, str | None, str | None, str, str]:
+    model_dir = os.path.normpath(str(model_dir).strip().strip('"').strip("'"))
+
+    if os.path.isfile(model_dir) and model_dir.lower().endswith(".pth"):
+        model_path = model_dir
+        model_dir = os.path.dirname(model_path)
+        ckpt_path = os.path.join(model_dir, "best_model_v4_transformer.ckpt")
+    else:
+        model_path = os.path.join(model_dir, "best_model_v4_transformer.pth")
+        ckpt_path = os.path.join(model_dir, "best_model_v4_transformer.ckpt")
+
+    ko_spm_path = os.path.join(model_dir, "spm_ko_v4.model")
+    zh_spm_path = os.path.join(model_dir, "spm_zh_v4.model")
+
+    if (not os.path.exists(model_path)) and os.path.isdir(model_dir):
+        cands = glob.glob(os.path.join(model_dir, "**", "best_model_v4_transformer.pth"), recursive=True)
+        if cands:
+            model_path = sorted(cands, key=lambda p: os.path.getmtime(p))[-1]
+            model_dir = os.path.dirname(model_path)
+            ckpt_path = os.path.join(model_dir, "best_model_v4_transformer.ckpt")
+            ko_spm_path = os.path.join(model_dir, "spm_ko_v4.model")
+            zh_spm_path = os.path.join(model_dir, "spm_zh_v4.model")
+
+    if (not os.path.exists(ckpt_path)) and os.path.isdir(model_dir):
+        cands = glob.glob(os.path.join(model_dir, "**", "best_model_v4_transformer.ckpt"), recursive=True)
+        if cands:
+            ckpt_path = sorted(cands, key=lambda p: os.path.getmtime(p))[-1]
+
+    if (not os.path.exists(ko_spm_path)) and os.path.isdir(model_dir):
+        cands = glob.glob(os.path.join(model_dir, "**", "spm_ko_v4.model"), recursive=True)
+        if cands:
+            ko_spm_path = sorted(cands, key=lambda p: os.path.getmtime(p))[-1]
+    if (not os.path.exists(zh_spm_path)) and os.path.isdir(model_dir):
+        cands = glob.glob(os.path.join(model_dir, "**", "spm_zh_v4.model"), recursive=True)
+        if cands:
+            zh_spm_path = sorted(cands, key=lambda p: os.path.getmtime(p))[-1]
+
+    model_path = model_path if os.path.exists(model_path) else None
+    ckpt_path = ckpt_path if os.path.exists(ckpt_path) else None
+    return model_dir, model_path, ckpt_path, ko_spm_path, zh_spm_path
+
+
+def _infer_transformer_hparams_from_state_dict_plain(state: dict) -> dict:
+    d_model = None
+    dim_ff = None
+    enc_layers = None
+    dec_layers = None
+
+    if isinstance(state, dict):
+        w = state.get("src_embedding.weight")
+        if w is None:
+            w = state.get("trg_embedding.weight")
+        if hasattr(w, "shape") and len(w.shape) == 2:
+            d_model = int(w.shape[1])
+
+        w2 = state.get("transformer.encoder.layers.0.linear1.weight")
+        if hasattr(w2, "shape") and len(w2.shape) == 2:
+            dim_ff = int(w2.shape[0])
+
+        enc_max = -1
+        dec_max = -1
+        for k in state.keys():
+            if not isinstance(k, str):
+                continue
+            m = re.match(r"^transformer\.encoder\.layers\.(\d+)\.", k)
+            if m:
+                enc_max = max(enc_max, int(m.group(1)))
+            m = re.match(r"^transformer\.decoder\.layers\.(\d+)\.", k)
+            if m:
+                dec_max = max(dec_max, int(m.group(1)))
+        if enc_max >= 0:
+            enc_layers = enc_max + 1
+        if dec_max >= 0:
+            dec_layers = dec_max + 1
+
+    d_model = 256 if d_model is None else int(d_model)
+    dim_ff = 1024 if dim_ff is None else int(dim_ff)
+    enc_layers = 6 if enc_layers is None else int(enc_layers)
+    dec_layers = 6 if dec_layers is None else int(dec_layers)
+
+    prefer = [8, 4, 16, 2, 1]
+    nhead = None
+    for h in prefer:
+        if d_model % int(h) == 0:
+            nhead = int(h)
+            break
+    if nhead is None:
+        nhead = 1
+
+    return {"d_model": d_model, "dim_ff": dim_ff, "enc_layers": enc_layers, "dec_layers": dec_layers, "nhead": nhead}
+
+
+def eval_set_transformer(
+    root: str,
+    eval_path: str,
+    model_dir: str,
+    translator_path: str,
+    eval_out: str | None = None,
+    eval_sheet: str | None = None,
+    n: int | None = None,
+    seed: int = 42,
+    max_len: int = 50,
+):
+    try:
+        import torch
+    except Exception as e:
+        print("缺少 torch，无法在本环境跑评估。错误:", e)
+        print("请使用装有 torch 的解释器运行，比如：python diagnose_mt.py --eval-set xxx.txt")
+        return
+
+    if spm is None:
+        print("缺少 sentencepiece，无法在本环境跑 Transformer(BPE) 评估。错误:", spm_import_error)
+        print("请使用装有 sentencepiece 的解释器运行。")
+        return
+
+    eval_items = _read_eval_set(eval_path, sheet=eval_sheet)
+    if not eval_items:
+        print("eval-set 为空，未评估。")
+        return
+
+    if n is not None and n > 0 and len(eval_items) > n:
+        random.seed(seed)
+        random.shuffle(eval_items)
+        eval_items = eval_items[:n]
+
+    mod = _load_module_from_path("rt_eval_v4_transformer", translator_path)
+    user_dict_path = os.path.join(root, "user_dict.md")
+    user_dict = mod.load_user_dict(user_dict_path) if hasattr(mod, "load_user_dict") else ({}, {}, {}, {})
+
+    md, model_path, ckpt_path, ko_spm_path, zh_spm_path = _resolve_v4_transformer_paths(model_dir)
+    if not model_path and not ckpt_path:
+        raise RuntimeError(f"找不到 V4 Transformer 模型文件: {os.path.normpath(str(model_dir))}")
+    if not os.path.exists(ko_spm_path) or not os.path.exists(zh_spm_path):
+        raise RuntimeError(f"找不到 SentencePiece 模型: {ko_spm_path} / {zh_spm_path}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ko_sp = spm.SentencePieceProcessor(model_file=ko_spm_path)
+    zh_sp = spm.SentencePieceProcessor(model_file=zh_spm_path)
+
+    if model_path:
+        state_obj = torch.load(model_path, map_location="cpu")
+    else:
+        state_obj = torch.load(str(ckpt_path), map_location="cpu")
+    if isinstance(state_obj, dict) and "model_state_dict" in state_obj and isinstance(state_obj["model_state_dict"], dict):
+        state = state_obj["model_state_dict"]
+    elif isinstance(state_obj, dict) and "state_dict" in state_obj and isinstance(state_obj["state_dict"], dict):
+        state = state_obj["state_dict"]
+    else:
+        state = state_obj
+    state = _unwrap_state_dict_plain(state)
+
+    if not hasattr(mod, "TransformerModel"):
+        raise RuntimeError(f"translator 脚本缺少 TransformerModel: {translator_path}")
+    if not hasattr(mod, "translate_sentence"):
+        raise RuntimeError(f"translator 脚本缺少 translate_sentence: {translator_path}")
+
+    hp = _infer_transformer_hparams_from_state_dict_plain(state if isinstance(state, dict) else {})
+    model = mod.TransformerModel(
+        n_src_vocab=int(ko_sp.get_piece_size()),
+        n_trg_vocab=int(zh_sp.get_piece_size()),
+        d_model=int(hp["d_model"]),
+        nhead=int(hp["nhead"]),
+        num_encoder_layers=int(hp["enc_layers"]),
+        num_decoder_layers=int(hp["dec_layers"]),
+        dim_feedforward=int(hp["dim_ff"]),
+        dropout=0.0,
+    ).to(device)
+    model.load_state_dict(state)
+    model.eval()
+
+    used_model_path = model_path or str(ckpt_path)
+    t0 = time.perf_counter()
+    rows = []
+    for it in eval_items:
+        ko = it.get("ko", "")
+        ref = it.get("ref", "")
+        try:
+            out = mod.translate_sentence(ko, model, ko_sp, zh_sp, device, user_dict, max_len=max_len)
+        except Exception as e:
+            print(f"[eval] 翻译异常: {type(e).__name__}: {e}", flush=True)
+            print("KO:", ko, flush=True)
+            out = "[ERROR]"
+
+        keep_src = _ascii_words_digits(ko)
+        keep_out = _ascii_words_digits(out)
+        keep_src_set = set(keep_src)
+        keep_score = sum(1 for x in keep_src_set if x in set(keep_out)) / max(1, len(keep_src_set))
+
+        rep_ratio, max_run = _repetition_bigram_ratio(out)
+        unk = "<unk>" in (out or "")
+        out_has_q = ("[?]" in (out or "")) or ("?" in (out or ""))
+        src_has_q = "?" in (ko or "")
+
+        src_len = len(re.sub(r"\s+", "", str(ko)))
+        out_len = len(re.sub(r"\s+", "", str(out)))
+        len_ratio_src = out_len / max(1, src_len)
+        ref_len = len(re.sub(r"\s+", "", str(ref))) if ref else 0
+        len_ratio_ref = (out_len / max(1, ref_len)) if ref_len else None
+
+        rows.append(
+            {
+                "ko": ko,
+                "ref": ref,
+                "out": out,
+                "unk": int(unk),
+                "src_qmark": int(src_has_q),
+                "out_qmark": int(out_has_q),
+                "keep_score": keep_score,
+                "rep_bigram": rep_ratio,
+                "max_run": max_run,
+                "src_len": src_len,
+                "out_len": out_len,
+                "len_ratio_src": len_ratio_src,
+                "len_ratio_ref": len_ratio_ref,
+            }
+        )
+    t1 = time.perf_counter()
+
+    print("\n[Eval 总结]")
+    print("translator:", translator_path)
+    print("model:", used_model_path)
+    print("spm_ko:", ko_spm_path)
+    print("spm_zh:", zh_spm_path)
+    print("samples:", len(rows))
+    print("device:", str(device))
+    print("elapsed_sec:", round(t1 - t0, 3))
+    print("unk rate:", sum(r["unk"] for r in rows) / max(1, len(rows)))
+    print("out '?' rate:", sum(r["out_qmark"] for r in rows) / max(1, len(rows)))
+    print("avg keep(ascii/digit) score:", sum(r["keep_score"] for r in rows) / max(1, len(rows)))
+    print("avg rep_bigram:", sum(r["rep_bigram"] for r in rows) / max(1, len(rows)))
+    print("avg len_ratio(src):", sum(r["len_ratio_src"] for r in rows) / max(1, len(rows)))
+
+    def collapse_flag(r):
+        return r["out_len"] <= 1 or r["len_ratio_src"] < 0.25
+
+    print("collapse rate:", sum(1 for r in rows if collapse_flag(r)) / max(1, len(rows)))
+
+    rows_sorted = sorted(rows, key=lambda r: (collapse_flag(r), r["unk"], r["rep_bigram"], -r["keep_score"]), reverse=True)
+    show = min(20, len(rows_sorted))
+    print(f"\n[问题样本 Top {show}]")
+    for i in range(show):
+        r = rows_sorted[i]
+        print("\n---")
+        print("KO:", r["ko"])
+        if r["ref"]:
+            print("REF:", r["ref"])
+        print("OUT:", r["out"])
+        print(
+            "unk:",
+            r["unk"],
+            "keep:",
+            round(r["keep_score"], 2),
+            "rep_bigram:",
+            round(r["rep_bigram"], 2),
+            "max_run:",
+            r["max_run"],
+            "len_ratio_src:",
+            round(r["len_ratio_src"], 2),
+        )
+
+    if eval_out:
+        eval_out = os.path.normpath(str(eval_out).strip().strip('"').strip("'"))
+        out_wb = openpyxl.Workbook()
+        ws = out_wb.active
+        ws.title = "Eval"
+        ws.append(
+            [
+                "ko",
+                "ref",
+                "out",
+                "unk",
+                "src_qmark",
+                "out_qmark",
+                "keep_score",
+                "rep_bigram",
+                "max_run",
+                "src_len",
+                "out_len",
+                "len_ratio_src",
+                "len_ratio_ref",
+            ]
+        )
+        for r in rows:
+            ws.append(
+                [
+                    r["ko"],
+                    r["ref"],
+                    r["out"],
+                    r["unk"],
+                    r["src_qmark"],
+                    r["out_qmark"],
+                    float(r["keep_score"]),
+                    float(r["rep_bigram"]),
+                    int(r["max_run"]),
+                    int(r["src_len"]),
+                    int(r["out_len"]),
+                    float(r["len_ratio_src"]),
+                    "" if r["len_ratio_ref"] is None else float(r["len_ratio_ref"]),
+                ]
+            )
+        out_wb.save(eval_out)
+        print("\n已保存:", eval_out)
+
+
 def eval_set(
     root: str,
     eval_path: str,
@@ -1544,6 +1879,24 @@ def eval_set(
 ):
     tp = os.path.basename(str(translator_path or "")).lower()
     md = os.path.normpath(str(model_dir).strip().strip('"').strip("'"))
+    is_v4_transformer = (
+        ("transformer" in tp)
+        or os.path.exists(os.path.join(md, "best_model_v4_transformer.pth"))
+        or os.path.exists(os.path.join(md, "best_model_v4_transformer.ckpt"))
+        or os.path.exists(os.path.join(md, "spm_ko_v4.model"))
+    )
+    if is_v4_transformer:
+        return eval_set_transformer(
+            root=root,
+            eval_path=eval_path,
+            model_dir=model_dir,
+            translator_path=translator_path,
+            eval_out=eval_out,
+            eval_sheet=eval_sheet,
+            n=n,
+            seed=seed,
+            max_len=max_len,
+        )
     is_bpe = ("bpe" in tp) or ("子词" in str(translator_path or "")) or os.path.exists(os.path.join(md, "spm_ko_v3_2_1.model"))
     if is_bpe:
         return eval_set_bpe(
@@ -1593,8 +1946,8 @@ def compare_rt(root: str, corpus_xlsx: str, model_dir: str, v30_path: str, v301_
     device = torch.device("cpu")
     input_dim = len(ko_vocab)
     output_dim = len(zh_vocab)
-    enc_emb_dim = 256
-    dec_emb_dim = 256
+    enc_emb_dim = 512
+    dec_emb_dim = 512
     hid_dim = 512
     n_layers = 1
 
@@ -1667,6 +2020,476 @@ def compare_rt(root: str, corpus_xlsx: str, model_dir: str, v30_path: str, v301_
         print("V3.0 :", r["out30"])
         print("V3.0.1:", r["out301"])
         print("sim:", round(r["sim"], 3), "unk30:", r["unk30"], "unk301:", r["unk301"], "keep30:", round(r["keep30"], 2), "keep301:", round(r["keep301"], 2))
+
+
+def _load_external_translator(plugin_path: str, module_name: str):
+    plugin_path = os.path.normpath(str(plugin_path).strip().strip('"').strip("'"))
+    if not plugin_path or not os.path.exists(plugin_path):
+        raise RuntimeError(f"翻译脚本不存在: {plugin_path}")
+
+    mod = _load_module_without_gui_entry(module_name, plugin_path)
+
+    class _SimpleVar:
+        def __init__(self, value: str):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    # 兼容 GUI 翻译脚本：如果内部依赖 translation_direction / update_ui_status，
+    # 则注入一个最小可用替身，让 diagnose_mt 可直接复用其翻译函数。
+    if not hasattr(mod, "translation_direction") or not callable(getattr(getattr(mod, "translation_direction", None), "get", None)):
+        setattr(mod, "translation_direction", _SimpleVar("ko2zh"))
+    if not hasattr(mod, "update_ui_status"):
+        setattr(mod, "update_ui_status", lambda *args, **kwargs: None)
+
+    batch_fn = (
+        getattr(mod, "translate_ko_to_zh", None)
+        or getattr(mod, "translate_sentences", None)
+        or getattr(mod, "get_translation_batch", None)
+    )
+    if callable(batch_fn):
+
+        def _batch_translate(sentences: list[str]) -> list[str]:
+            out = batch_fn(list(sentences))
+            if not isinstance(out, list):
+                raise RuntimeError(f"{plugin_path} 的批量翻译函数返回值不是 list")
+            if len(out) != len(sentences):
+                raise RuntimeError(f"{plugin_path} 的批量翻译结果数量不匹配: in={len(sentences)} out={len(out)}")
+            return ["" if x is None else str(x) for x in out]
+
+        return _batch_translate
+
+    single_fn = (
+        getattr(mod, "translate_sentence", None)
+        or getattr(mod, "translate_text", None)
+        or getattr(mod, "translate", None)
+        or getattr(mod, "translate_ko", None)
+        or getattr(mod, "get_translation", None)
+    )
+    if callable(single_fn):
+
+        def _single_translate(sentences: list[str]) -> list[str]:
+            out = []
+            for s in sentences:
+                try:
+                    r = single_fn(str(s))
+                except TypeError:
+                    r = single_fn(text=str(s))
+                out.append("" if r is None else str(r))
+            return out
+
+        return _single_translate
+
+    raise RuntimeError(
+        f"{plugin_path} 中未找到可用翻译接口。请至少实现以下之一："
+        "translate_ko_to_zh(list[str]) -> list[str] / translate_sentences(list[str]) -> list[str] / "
+        "get_translation_batch(list[str]) -> list[str] / translate_sentence(str) -> str / "
+        "translate_text(str) -> str / get_translation(str) -> str"
+    )
+
+
+def _score_length_ratio_points(ratio: float, category: str) -> float:
+    if category == "automatic":
+        if 0.55 <= ratio <= 1.65:
+            return 10.0
+        if 0.40 <= ratio <= 2.10:
+            return 7.0
+        if 0.25 <= ratio <= 3.00:
+            return 4.0
+        return 0.0
+    if 0.60 <= ratio <= 1.90:
+        return 10.0
+    if 0.45 <= ratio <= 2.40:
+        return 7.0
+    if 0.30 <= ratio <= 3.20:
+        return 4.0
+    return 0.0
+
+
+def _score_structure_points(src: str, out: str) -> float:
+    checks = []
+    for lch, rch in [("(", ")"), ("（", "）"), ("[", "]"), ("{", "}")]:
+        src_total = src.count(lch) + src.count(rch)
+        if src_total <= 0:
+            continue
+        out_l = out.count(lch)
+        out_r = out.count(rch)
+        if out_l == src.count(lch) and out_r == src.count(rch):
+            checks.append(1.0)
+        elif out_l == out_r and (out_l + out_r) > 0:
+            checks.append(0.5)
+        else:
+            checks.append(0.0)
+    if not checks:
+        return 5.0
+    return round(5.0 * sum(checks) / max(1, len(checks)), 2)
+
+
+def _looks_error_output(text: str) -> bool:
+    s = str(text or "").strip().lower()
+    if not s:
+        return True
+    for bad in ("[error]", "traceback", "exception", "error:", "notimplemented", "<unk>", "[?]"):
+        if bad in s:
+            return True
+    return False
+
+
+def _char_ngram_f1(pred: str, ref: str, n: int = 2) -> float:
+    pred = re.sub(r"\s+", "", str(pred or ""))
+    ref = re.sub(r"\s+", "", str(ref or ""))
+    if not pred or not ref:
+        return 0.0
+
+    def _ngrams(text: str, k: int) -> Counter:
+        if len(text) < k:
+            return Counter([text]) if text else Counter()
+        return Counter(text[i : i + k] for i in range(len(text) - k + 1))
+
+    pred_ng = _ngrams(pred, n)
+    ref_ng = _ngrams(ref, n)
+    overlap = sum(min(c, ref_ng.get(g, 0)) for g, c in pred_ng.items())
+    pred_total = sum(pred_ng.values())
+    ref_total = sum(ref_ng.values())
+    p = overlap / max(1, pred_total)
+    r = overlap / max(1, ref_total)
+    if p + r <= 0:
+        return 0.0
+    return (2.0 * p * r) / (p + r)
+
+
+def _score_ref_length_points(ratio: float) -> float:
+    if 0.85 <= ratio <= 1.20:
+        return 5.0
+    if 0.70 <= ratio <= 1.45:
+        return 3.5
+    if 0.50 <= ratio <= 1.80:
+        return 2.0
+    return 0.0
+
+
+def _translation_effect_score(ko: str, out: str, category: str, ref: str = "") -> dict:
+    ko = "" if ko is None else str(ko).strip()
+    out = "" if out is None else str(out).strip()
+    ref = "" if ref is None else str(ref).strip()
+    notes = []
+
+    non_empty = 15.0 if out else 0.0
+    if non_empty <= 0:
+        notes.append("空输出")
+
+    hanzi_count = len(_HANZI_RE.findall(out))
+    hanzi_presence = 10.0 if hanzi_count > 0 else 0.0
+    if hanzi_presence <= 0:
+        notes.append("缺少中文")
+
+    hangul_left = len(_HANGUL_RE.findall(out))
+    if hangul_left == 0:
+        no_hangul_left = 15.0
+    elif hangul_left <= 2:
+        no_hangul_left = 8.0
+        notes.append("残留少量韩文")
+    else:
+        no_hangul_left = 0.0
+        notes.append("残留韩文")
+
+    no_error_marker = 0.0 if _looks_error_output(out) else 10.0
+    if no_error_marker <= 0:
+        notes.append("疑似错误标记")
+
+    src_keep = set(_ascii_words_digits(ko))
+    out_keep = set(_ascii_words_digits(out))
+    keep_ratio = (sum(1 for x in src_keep if x in out_keep) / max(1, len(src_keep))) if src_keep else 1.0
+    ascii_digit_keep = round(15.0 * keep_ratio, 2)
+    if src_keep and keep_ratio < 0.8:
+        notes.append("字母/数字保留不足")
+
+    puncts = [ch for ch in str(ko) if ch in "?!.:,;()[]{}%/-+~"]
+    src_punct = Counter(puncts)
+    out_punct = Counter(ch for ch in str(out) if ch in "?!.:,;()[]{}%/-+~")
+    if src_punct:
+        punct_keep_ratio = sum(min(v, out_punct.get(k, 0)) for k, v in src_punct.items()) / max(1, sum(src_punct.values()))
+    else:
+        punct_keep_ratio = 1.0
+    punctuation_keep = round(10.0 * punct_keep_ratio, 2)
+    if src_punct and punct_keep_ratio < 0.8:
+        notes.append("标点/符号保留不足")
+
+    src_len = len(re.sub(r"\s+", "", ko))
+    out_len = len(re.sub(r"\s+", "", out))
+    len_ratio = out_len / max(1, src_len)
+    length_ratio_score = _score_length_ratio_points(len_ratio, category)
+    if length_ratio_score < 7.0:
+        notes.append("长度比例异常")
+
+    rep_ratio, max_run = _repetition_bigram_ratio(out)
+    if rep_ratio <= 0.18 and max_run <= 2:
+        repetition_fluency = 10.0
+    elif rep_ratio <= 0.30 and max_run <= 3:
+        repetition_fluency = 6.0
+        notes.append("存在重复痕迹")
+    else:
+        repetition_fluency = 2.0 if out else 0.0
+        notes.append("重复较明显")
+
+    structure_balance = _score_structure_points(ko, out)
+    if structure_balance < 5.0:
+        notes.append("括号/结构不稳定")
+
+    if category == "automatic":
+        category_fit = round(10.0 * ((keep_ratio * 0.7) + (punct_keep_ratio * 0.3)), 2)
+        if category_fit < 7.0:
+            notes.append("术语/单位保留一般")
+    else:
+        ascii_out = _ascii_words_digits(out)
+        ascii_penalty = 1.0 if len(ascii_out) <= max(2, len(src_keep) + 2) else 0.6
+        natural_bonus = 1.0 if (hanzi_count > 0 and rep_ratio <= 0.25) else 0.5
+        category_fit = round(10.0 * ascii_penalty * natural_bonus, 2)
+        if category_fit < 7.0:
+            notes.append("生活句自然度一般")
+
+    base_total = round(
+        non_empty
+        + hanzi_presence
+        + no_hangul_left
+        + no_error_marker
+        + ascii_digit_keep
+        + punctuation_keep
+        + length_ratio_score
+        + repetition_fluency
+        + structure_balance
+        + category_fit,
+        2,
+    )
+    base_total = max(0.0, min(100.0, base_total))
+
+    score_base_scaled = base_total
+    score_ref_seq = 0.0
+    score_ref_char_ngram = 0.0
+    score_ref_length = 0.0
+    ref_seq_ratio = 0.0
+    ref_char_f1 = 0.0
+
+    if ref:
+        score_base_scaled = round(base_total * 0.7, 2)
+        ref_seq_ratio = difflib.SequenceMatcher(None, out, ref).ratio() if out and ref else 0.0
+        ref_char_f1 = _char_ngram_f1(out, ref, n=2)
+        ref_len = len(re.sub(r"\s+", "", ref))
+        ref_len_ratio = out_len / max(1, ref_len)
+        score_ref_seq = round(15.0 * ref_seq_ratio, 2)
+        score_ref_char_ngram = round(10.0 * ref_char_f1, 2)
+        score_ref_length = _score_ref_length_points(ref_len_ratio)
+        if ref_seq_ratio < 0.55:
+            notes.append("参考答案相似度偏低")
+        if ref_char_f1 < 0.55:
+            notes.append("参考字符匹配偏低")
+        total = round(score_base_scaled + score_ref_seq + score_ref_char_ngram + score_ref_length, 2)
+    else:
+        total = base_total
+
+    total = max(0.0, min(100.0, total))
+
+    return {
+        "score_total": total,
+        "score_base_scaled": score_base_scaled,
+        "score_non_empty": non_empty,
+        "score_hanzi_presence": hanzi_presence,
+        "score_no_hangul_left": no_hangul_left,
+        "score_no_error_marker": no_error_marker,
+        "score_ascii_digit_keep": ascii_digit_keep,
+        "score_punctuation_keep": punctuation_keep,
+        "score_length_ratio": length_ratio_score,
+        "score_repetition_fluency": repetition_fluency,
+        "score_structure_balance": structure_balance,
+        "score_category_fit": category_fit,
+        "score_ref_seq": score_ref_seq,
+        "score_ref_char_ngram": score_ref_char_ngram,
+        "score_ref_length": score_ref_length,
+        "len_ratio": round(len_ratio, 4),
+        "keep_ratio": round(keep_ratio, 4),
+        "punct_keep_ratio": round(punct_keep_ratio, 4),
+        "rep_bigram": round(rep_ratio, 4),
+        "ref_seq_ratio": round(ref_seq_ratio, 4),
+        "ref_char_f1": round(ref_char_f1, 4),
+        "max_run": int(max_run),
+        "hangul_left": int(hangul_left),
+        "notes": " | ".join(notes),
+    }
+
+
+def _save_single_translator_score_xlsx(output_xlsx: str, translator_name: str, rows: list[dict], elapsed_sec: float):
+    if not rows:
+        raise RuntimeError(f"{translator_name} 没有可输出的评分结果")
+
+    os.makedirs(os.path.dirname(output_xlsx) or ".", exist_ok=True)
+
+    def _grade(score: float) -> str:
+        s = float(score)
+        if s >= 90:
+            return "优秀"
+        if s >= 80:
+            return "可用"
+        if s >= 60:
+            return "待人工复核"
+        return "不建议直接使用"
+
+    categories = []
+    seen = set()
+    for r in rows:
+        c = str(r.get("category", ""))
+        if c not in seen:
+            seen.add(c)
+            categories.append(c)
+    if "overall" not in seen:
+        categories.append("overall")
+
+    wb = openpyxl.Workbook()
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+    ws_sum.append(["translator", "category", "samples", "avg_score", "excellent", "usable", "review", "reject", "elapsed_sec"])
+
+    for category in categories:
+        cat_rows = rows if category == "overall" else [r for r in rows if r.get("category") == category]
+        if not cat_rows:
+            continue
+        grades = Counter(_grade(float(r.get("score_total", 0.0))) for r in cat_rows)
+        ws_sum.append(
+            [
+                translator_name,
+                category,
+                len(cat_rows),
+                round(sum(float(r.get("score_total", 0.0)) for r in cat_rows) / max(1, len(cat_rows)), 2),
+                grades.get("优秀", 0),
+                grades.get("可用", 0),
+                grades.get("待人工复核", 0),
+                grades.get("不建议直接使用", 0),
+                round(float(elapsed_sec), 3),
+            ]
+        )
+
+    ws_detail = wb.create_sheet("Detail")
+    detail_header = [
+        "category",
+        "row_no",
+        "ko",
+        "ref",
+        "out",
+        "score_total",
+        "grade",
+        "score_base_scaled",
+        "score_non_empty",
+        "score_hanzi_presence",
+        "score_no_hangul_left",
+        "score_no_error_marker",
+        "score_ascii_digit_keep",
+        "score_punctuation_keep",
+        "score_length_ratio",
+        "score_repetition_fluency",
+        "score_structure_balance",
+        "score_category_fit",
+        "score_ref_seq",
+        "score_ref_char_ngram",
+        "score_ref_length",
+        "len_ratio",
+        "keep_ratio",
+        "punct_keep_ratio",
+        "rep_bigram",
+        "ref_seq_ratio",
+        "ref_char_f1",
+        "max_run",
+        "hangul_left",
+        "notes",
+    ]
+    ws_detail.append(detail_header)
+    for r in rows:
+        row = dict(r)
+        row["grade"] = _grade(float(row.get("score_total", 0.0)))
+        ws_detail.append([row.get(k, "") for k in detail_header])
+
+    wb.save(output_xlsx)
+
+
+def score_external_translators(
+    life_eval_path: str,
+    auto_eval_path: str,
+    baidu_path: str,
+    kimi_path: str,
+    baidu_output_xlsx: str,
+    kimi_output_xlsx: str,
+    n: int | None = None,
+    seed: int = 42,
+):
+    life_eval_path = os.path.normpath(str(life_eval_path).strip().strip('"').strip("'"))
+    auto_eval_path = os.path.normpath(str(auto_eval_path).strip().strip('"').strip("'"))
+    baidu_path = os.path.normpath(str(baidu_path).strip().strip('"').strip("'"))
+    kimi_path = os.path.normpath(str(kimi_path).strip().strip('"').strip("'"))
+    baidu_output_xlsx = os.path.normpath(str(baidu_output_xlsx).strip().strip('"').strip("'"))
+    kimi_output_xlsx = os.path.normpath(str(kimi_output_xlsx).strip().strip('"').strip("'"))
+
+    if not os.path.exists(life_eval_path):
+        raise RuntimeError(f"生活语句文件不存在: {life_eval_path}")
+    if not os.path.exists(auto_eval_path):
+        raise RuntimeError(f"自动化语句文件不存在: {auto_eval_path}")
+    if not os.path.exists(baidu_path):
+        raise RuntimeError(f"Baidu 翻译脚本不存在: {baidu_path}")
+    if not os.path.exists(kimi_path):
+        raise RuntimeError(f"Kimi 翻译脚本不存在: {kimi_path}")
+
+    baidu_translate = _load_external_translator(baidu_path, "ext_baidu_translator")
+    kimi_translate = _load_external_translator(kimi_path, "ext_kimi_translator")
+
+    baidu_rows = []
+    kimi_rows = []
+    datasets = [("life", life_eval_path), ("automatic", auto_eval_path)]
+    t0 = time.perf_counter()
+
+    for category, eval_path in datasets:
+        items = _read_eval_set(eval_path, sheet=None)
+        if not items:
+            print(f"[warn] {category} 数据集为空: {eval_path}")
+            continue
+
+        if n is not None and int(n) > 0 and len(items) > int(n):
+            random.seed(seed)
+            random.shuffle(items)
+            items = items[: int(n)]
+
+        ko_list = [str(it.get("ko", "")).strip() for it in items]
+        print(f"[external-score] {category} 样本数: {len(ko_list)}", flush=True)
+
+        baidu_outs = baidu_translate(ko_list)
+        kimi_outs = kimi_translate(ko_list)
+        if len(baidu_outs) != len(ko_list) or len(kimi_outs) != len(ko_list):
+            raise RuntimeError(f"{category} 翻译结果数量不匹配")
+
+        for idx, ko in enumerate(ko_list, start=1):
+            ref = "" if items[idx - 1].get("ref") is None else str(items[idx - 1].get("ref")).strip()
+            baidu_out = "" if baidu_outs[idx - 1] is None else str(baidu_outs[idx - 1])
+            kimi_out = "" if kimi_outs[idx - 1] is None else str(kimi_outs[idx - 1])
+            baidu_score = _translation_effect_score(ko, baidu_out, category, ref=ref)
+            kimi_score = _translation_effect_score(ko, kimi_out, category, ref=ref)
+            baidu_row = {"category": category, "row_no": idx, "ko": ko, "ref": ref, "out": baidu_out}
+            kimi_row = {"category": category, "row_no": idx, "ko": ko, "ref": ref, "out": kimi_out}
+            baidu_row.update(baidu_score)
+            kimi_row.update(kimi_score)
+            baidu_rows.append(baidu_row)
+            kimi_rows.append(kimi_row)
+
+    t1 = time.perf_counter()
+    elapsed_sec = round(t1 - t0, 3)
+
+    _save_single_translator_score_xlsx(baidu_output_xlsx, "baidu", baidu_rows, elapsed_sec=elapsed_sec)
+    _save_single_translator_score_xlsx(kimi_output_xlsx, "kimi", kimi_rows, elapsed_sec=elapsed_sec)
+
+    print("\n[外部翻译评分总结]")
+    print("life_eval_path:", life_eval_path)
+    print("auto_eval_path:", auto_eval_path)
+    print("baidu_path:", baidu_path)
+    print("kimi_path:", kimi_path)
+    print("elapsed_sec:", elapsed_sec)
+    print("已保存(Baidu):", baidu_output_xlsx)
+    print("已保存(Kimi):", kimi_output_xlsx)
 
 
 KO_RE = re.compile(r"[\uAC00-\uD7A3]")
@@ -1887,11 +2710,13 @@ def ui_main():
     tab3 = ttk.Frame(nb, padding=10)
     tab4 = ttk.Frame(nb, padding=10)
     tab5 = ttk.Frame(nb, padding=10)
+    tab6 = ttk.Frame(nb, padding=10)
     nb.add(tab1, text="打标/打分")
     nb.add(tab2, text="清洗")
     nb.add(tab3, text="评估")
     nb.add(tab4, text="对比")
     nb.add(tab5, text="词表诊断")
+    nb.add(tab6, text="外部评分")
 
     v1 = {
         "input_xlsx": tk.StringVar(value=r"D:\PythonProject\NEW-CORPUS-20260602.cleaned.xlsx"),
@@ -2089,7 +2914,7 @@ def ui_main():
 
     v3 = {
         "eval_path": tk.StringVar(value=r"D:\PythonProject\for_live_sentences_ko.txt"),
-        "model_dir": tk.StringVar(value=r"D:\PythonProject\Translate Model\V3.0(Attention)\20260527-best Model\epoch03-4.4666"),
+        "model_dir": tk.StringVar(value=r"D:\PythonProject\Translate Model\Google_colab\V4.0_Tranformer\_1st\Epoch30_test_loss 6.5368"),
         "translator": tk.StringVar(value=r"D:\PythonProject\实时翻译测试_V3.0.1(greedy).py"),
         "eval_out": tk.StringVar(value=r"D:\PythonProject\evaluate models performance\evaluation_result.xlsx"),
         "eval_sheet": tk.StringVar(value=""),
@@ -2347,6 +3172,145 @@ def ui_main():
     ttk.Button(tab5, text="运行本页", command=v5_run).grid(row=r, column=0, sticky="w", pady=8)
     tab5.columnconfigure(1, weight=1)
 
+    v6 = {
+        "life_eval_path": tk.StringVar(value=r"D:\PythonProject\for_live_sentences_ko.standard.tsv"),
+        "auto_eval_path": tk.StringVar(value=r"D:\PythonProject\for_automatic_sentences_ko.standard.tsv"),
+        "baidu_path": tk.StringVar(value=r"D:\pythonproject 2\File Translation tools\（baidu）Translator-V2.12(片段翻译-保存Corpus更新）.py"),
+        "kimi_path": tk.StringVar(value=r"D:\pythonproject 2\File Translation tools\（kimi）Translator-V2.14(批量请求）.py"),
+        "baidu_output_xlsx": tk.StringVar(value=_timestamped_score_output_path("baidu_score")),
+        "kimi_output_xlsx": tk.StringVar(value=_timestamped_score_output_path("kimi_score")),
+        "n": tk.StringVar(value="0"),
+        "seed": tk.StringVar(value="42"),
+    }
+
+    def v6_browse_life():
+        p = _browse_open_any("选择生活语句文件")
+        if p:
+            v6["life_eval_path"].set(p)
+
+    def v6_browse_auto():
+        p = _browse_open_any("选择自动化语句文件")
+        if p:
+            v6["auto_eval_path"].set(p)
+
+    def v6_browse_baidu():
+        p = _browse_open_py("选择 Baidu 翻译脚本")
+        if p:
+            v6["baidu_path"].set(p)
+
+    def v6_browse_kimi():
+        p = _browse_open_py("选择 Kimi 翻译脚本")
+        if p:
+            v6["kimi_path"].set(p)
+
+    def v6_browse_baidu_output():
+        init_dir = r"D:\PythonProject\evaluate models performance"
+        if not os.path.exists(init_dir):
+            try:
+                os.makedirs(init_dir, exist_ok=True)
+            except Exception:
+                init_dir = None
+        p = _browse_save_xlsx("选择导出 Baidu 评分表 xlsx", initialdir=init_dir)
+        if p:
+            v6["baidu_output_xlsx"].set(p)
+
+    def v6_browse_kimi_output():
+        init_dir = r"D:\PythonProject\evaluate models performance"
+        if not os.path.exists(init_dir):
+            try:
+                os.makedirs(init_dir, exist_ok=True)
+            except Exception:
+                init_dir = None
+        p = _browse_save_xlsx("选择导出 Kimi 评分表 xlsx", initialdir=init_dir)
+        if p:
+            v6["kimi_output_xlsx"].set(p)
+
+    def v6_run():
+        life_eval_path = _norm_path(v6["life_eval_path"].get())
+        auto_eval_path = _norm_path(v6["auto_eval_path"].get())
+        baidu_path = _norm_path(v6["baidu_path"].get())
+        kimi_path = _norm_path(v6["kimi_path"].get())
+        baidu_output_xlsx = _norm_path(v6["baidu_output_xlsx"].get())
+        kimi_output_xlsx = _norm_path(v6["kimi_output_xlsx"].get())
+        try:
+            n = int(v6["n"].get().strip())
+            seed = int(v6["seed"].get().strip())
+        except Exception:
+            messagebox.showerror("参数错误", "n/seed 必须是整数")
+            return
+        if not life_eval_path or not os.path.exists(life_eval_path):
+            messagebox.showerror("参数错误", "生活语句文件不存在")
+            return
+        if not auto_eval_path or not os.path.exists(auto_eval_path):
+            messagebox.showerror("参数错误", "自动化语句文件不存在")
+            return
+        if not baidu_path or not os.path.exists(baidu_path):
+            messagebox.showerror("参数错误", "Baidu 翻译脚本不存在")
+            return
+        if not kimi_path or not os.path.exists(kimi_path):
+            messagebox.showerror("参数错误", "Kimi 翻译脚本不存在")
+            return
+        if not baidu_output_xlsx or not kimi_output_xlsx:
+            messagebox.showerror("参数错误", "Baidu/Kimi 输出文件都不能为空")
+            return
+
+        def task():
+            print("\n[UI] 开始：外部翻译评分")
+            score_external_translators(
+                life_eval_path=life_eval_path,
+                auto_eval_path=auto_eval_path,
+                baidu_path=baidu_path,
+                kimi_path=kimi_path,
+                baidu_output_xlsx=baidu_output_xlsx,
+                kimi_output_xlsx=kimi_output_xlsx,
+                n=(n if n > 0 else None),
+                seed=seed,
+            )
+            print("\n[UI] 完成")
+
+        run_in_thread(lambda: task(), {})
+
+    r = 0
+    ttk.Label(tab6, text="生活语句文件").grid(row=r, column=0, sticky="w")
+    ttk.Entry(tab6, textvariable=v6["life_eval_path"], width=86).grid(row=r, column=1, sticky="we", padx=6)
+    ttk.Button(tab6, text="选择", command=v6_browse_life).grid(row=r, column=2, sticky="we")
+    r += 1
+    ttk.Label(tab6, text="自动化语句文件").grid(row=r, column=0, sticky="w")
+    ttk.Entry(tab6, textvariable=v6["auto_eval_path"], width=86).grid(row=r, column=1, sticky="we", padx=6)
+    ttk.Button(tab6, text="选择", command=v6_browse_auto).grid(row=r, column=2, sticky="we")
+    r += 1
+    ttk.Label(tab6, text="Baidu 脚本").grid(row=r, column=0, sticky="w")
+    ttk.Entry(tab6, textvariable=v6["baidu_path"], width=86).grid(row=r, column=1, sticky="we", padx=6)
+    ttk.Button(tab6, text="选择", command=v6_browse_baidu).grid(row=r, column=2, sticky="we")
+    r += 1
+    ttk.Label(tab6, text="Kimi 脚本").grid(row=r, column=0, sticky="w")
+    ttk.Entry(tab6, textvariable=v6["kimi_path"], width=86).grid(row=r, column=1, sticky="we", padx=6)
+    ttk.Button(tab6, text="选择", command=v6_browse_kimi).grid(row=r, column=2, sticky="we")
+    r += 1
+    ttk.Label(tab6, text="Baidu 输出文件").grid(row=r, column=0, sticky="w")
+    ttk.Entry(tab6, textvariable=v6["baidu_output_xlsx"], width=86).grid(row=r, column=1, sticky="we", padx=6)
+    ttk.Button(tab6, text="选择", command=v6_browse_baidu_output).grid(row=r, column=2, sticky="we")
+    r += 1
+    ttk.Label(tab6, text="Kimi 输出文件").grid(row=r, column=0, sticky="w")
+    ttk.Entry(tab6, textvariable=v6["kimi_output_xlsx"], width=86).grid(row=r, column=1, sticky="we", padx=6)
+    ttk.Button(tab6, text="选择", command=v6_browse_kimi_output).grid(row=r, column=2, sticky="we")
+    r += 1
+    sub = ttk.Frame(tab6)
+    sub.grid(row=r, column=0, columnspan=3, sticky="w", pady=6)
+    ttk.Label(sub, text="n(0=全部)").grid(row=0, column=0, sticky="w")
+    ttk.Entry(sub, textvariable=v6["n"], width=8).grid(row=0, column=1, sticky="w", padx=6)
+    ttk.Label(sub, text="seed").grid(row=0, column=2, sticky="w")
+    ttk.Entry(sub, textvariable=v6["seed"], width=8).grid(row=0, column=3, sticky="w", padx=6)
+    r += 1
+    ttk.Label(
+        tab6,
+        text="评分项: 空输出/中文存在/残留韩文/错误标记/字母数字保留/标点保留/长度比例/重复流畅度/结构平衡/分类适配，总分 100",
+        wraplength=860,
+    ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 6))
+    r += 1
+    ttk.Button(tab6, text="运行本页", command=v6_run).grid(row=r, column=0, sticky="w", pady=8)
+    tab6.columnconfigure(1, weight=1)
+
     bottom = ttk.Frame(frame)
     bottom.pack(fill="both", expand=False, pady=(10, 0))
     btns = ttk.Frame(bottom)
@@ -2366,6 +3330,7 @@ def main():
     parser.add_argument("--corpus", default="Corpus(K2C)-2.xlsx")
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--plugin-score", action="store_true")
     parser.add_argument("--clean-corpus", action="store_true")
     parser.add_argument("--tag-corpus", action="store_true")
     parser.add_argument("--score-corpus", action="store_true")
@@ -2389,6 +3354,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--v30", default=None)
     parser.add_argument("--v301", default=None)
+    parser.add_argument("--life-set", default=r"D:\PythonProject\for_live_sentences_ko.standard.tsv")
+    parser.add_argument("--auto-set", default=r"D:\PythonProject\for_automatic_sentences_ko.standard.tsv")
+    parser.add_argument("--baidu-plugin", default=r"D:\pythonproject 2\File Translation tools\（baidu）Translator-V2.12(片段翻译-保存Corpus更新）.py")
+    parser.add_argument("--kimi-plugin", default=r"D:\pythonproject 2\File Translation tools\（kimi）Translator-V2.14(批量请求）.py")
+    parser.add_argument("--baidu-score-out", default=_timestamped_score_output_path("baidu_score"))
+    parser.add_argument("--kimi-score-out", default=_timestamped_score_output_path("kimi_score"))
     parser.add_argument("--ui", action="store_true")
     args = parser.parse_args()
 
@@ -2457,6 +3428,19 @@ def main():
             min_hanzi_ratio=float(args.min_hanzi_ratio),
             drop_identical=(not args.keep_identical),
             drop_qmark=(not args.keep_qmark),
+        )
+        return
+
+    if args.plugin_score:
+        score_external_translators(
+            life_eval_path=args.life_set,
+            auto_eval_path=args.auto_set,
+            baidu_path=args.baidu_plugin,
+            kimi_path=args.kimi_plugin,
+            baidu_output_xlsx=args.baidu_score_out,
+            kimi_output_xlsx=args.kimi_score_out,
+            n=(args.n if int(args.n) > 0 else None),
+            seed=int(args.seed),
         )
         return
 
