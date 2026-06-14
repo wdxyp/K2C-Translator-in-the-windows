@@ -5,6 +5,7 @@ import math
 import os
 import random
 import re
+import shutil
 import warnings
 from dataclasses import dataclass
 
@@ -18,6 +19,7 @@ warnings.filterwarnings(
 import numpy as np
 import pandas as pd
 from datasets import Dataset
+from transformers import TrainerCallback
 
 
 DEFAULT_KAGGLE_DATASET_ROOT = "/kaggle/input/datasets"
@@ -123,6 +125,178 @@ def resolve_nllb_model_path(model_name_or_dir: str) -> str:
         return sorted(preferred or recursive_candidates)[0]
 
     raise RuntimeError(f"无法在目录中定位可加载的 NLLB 模型: {model_dir}")
+
+
+def _extract_checkpoint_step(path: str) -> int:
+    match = re.search(r"checkpoint-(\d+)$", os.path.basename(os.path.normpath(path)))
+    return int(match.group(1)) if match else -1
+
+
+def find_latest_checkpoint(output_dir: str) -> str | None:
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+    candidates = []
+    for name in os.listdir(output_dir):
+        full_path = os.path.join(output_dir, name)
+        if os.path.isdir(full_path) and re.fullmatch(r"checkpoint-\d+", name):
+            candidates.append(full_path)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda x: (_extract_checkpoint_step(x), x))[-1]
+
+
+def read_best_checkpoint_record(output_dir: str) -> str | None:
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+
+    best_json = os.path.join(output_dir, "best_checkpoint.json")
+    if os.path.isfile(best_json):
+        try:
+            with open(best_json, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            checkpoint_path = str(payload.get("best_model_checkpoint", "")).strip()
+            if checkpoint_path and os.path.isdir(checkpoint_path):
+                return checkpoint_path
+        except Exception:
+            pass
+
+    best_txt = os.path.join(output_dir, "best_checkpoint.txt")
+    if os.path.isfile(best_txt):
+        try:
+            with open(best_txt, "r", encoding="utf-8") as f:
+                checkpoint_path = f.read().strip()
+            if checkpoint_path and os.path.isdir(checkpoint_path):
+                return checkpoint_path
+        except Exception:
+            pass
+
+    return None
+
+
+def resolve_resume_checkpoint_path(resume_from_checkpoint: str, output_dir: str) -> str | None:
+    raw_value = str(resume_from_checkpoint or "").strip().strip('"').strip("'")
+    if not raw_value:
+        return None
+
+    mode = raw_value.lower()
+    if mode in {"true", "1", "yes", "y"}:
+        mode = "best"
+    elif mode in {"false", "0", "no", "n", "none", "null"}:
+        return None
+
+    if mode in {"best", "auto"}:
+        best_checkpoint = read_best_checkpoint_record(output_dir)
+        if best_checkpoint:
+            return best_checkpoint
+        latest_checkpoint = find_latest_checkpoint(output_dir)
+        if latest_checkpoint:
+            return latest_checkpoint
+        print(f"[续训] 未找到 best 或 checkpoint-*，改为从头开始训练: {output_dir}")
+        return None
+
+    if mode in {"latest", "last"}:
+        latest_checkpoint = find_latest_checkpoint(output_dir)
+        if latest_checkpoint:
+            return latest_checkpoint
+        print(f"[续训] 未找到 checkpoint-*，改为从头开始训练: {output_dir}")
+        return None
+
+    checkpoint_path = os.path.normpath(raw_value)
+    if os.path.isfile(checkpoint_path):
+        if os.path.basename(checkpoint_path) == "best_checkpoint.json":
+            with open(checkpoint_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            best_checkpoint = str(payload.get("best_model_checkpoint", "")).strip()
+            if best_checkpoint and os.path.isdir(best_checkpoint):
+                return best_checkpoint
+        if os.path.basename(checkpoint_path) == "best_checkpoint.txt":
+            with open(checkpoint_path, "r", encoding="utf-8") as f:
+                best_checkpoint = f.read().strip()
+            if best_checkpoint and os.path.isdir(best_checkpoint):
+                return best_checkpoint
+        raise RuntimeError(f"续训失败：文件不是有效的 best checkpoint 记录: {checkpoint_path}")
+
+    if os.path.isdir(checkpoint_path):
+        if re.fullmatch(r"checkpoint-\d+", os.path.basename(checkpoint_path)):
+            return checkpoint_path
+        best_checkpoint = read_best_checkpoint_record(checkpoint_path)
+        if best_checkpoint:
+            return best_checkpoint
+        latest_checkpoint = find_latest_checkpoint(checkpoint_path)
+        if latest_checkpoint:
+            return latest_checkpoint
+        raise RuntimeError(f"续训失败：目录中未找到可恢复的 checkpoint: {checkpoint_path}")
+
+    raise RuntimeError(f"续训路径不存在: {raw_value}")
+
+
+def make_zip_from_directory(source_dir: str, zip_path: str) -> str | None:
+    source_dir = os.path.normpath(str(source_dir).strip())
+    if not source_dir or not os.path.isdir(source_dir):
+        return None
+
+    zip_base = os.path.splitext(os.path.normpath(zip_path))[0]
+    zip_file = f"{zip_base}.zip"
+    if os.path.exists(zip_file):
+        os.remove(zip_file)
+
+    return shutil.make_archive(
+        zip_base,
+        "zip",
+        root_dir=os.path.dirname(source_dir),
+        base_dir=os.path.basename(source_dir),
+    )
+
+
+def persist_best_checkpoint_artifacts(
+    output_dir: str,
+    best_model_checkpoint: str | None,
+    best_metric,
+    metric_for_best_model: str,
+    greater_is_better: bool,
+    global_step: int,
+) -> str | None:
+    best_checkpoint_dir = str(best_model_checkpoint or "").strip()
+    best_zip_path = None
+
+    if best_checkpoint_dir and os.path.isdir(best_checkpoint_dir):
+        best_zip_path = make_zip_from_directory(
+            best_checkpoint_dir,
+            os.path.join(output_dir, "best_checkpoint.zip"),
+        )
+
+    best_checkpoint_payload = {
+        "best_model_checkpoint": best_checkpoint_dir,
+        "best_metric": best_metric,
+        "metric_for_best_model": metric_for_best_model,
+        "greater_is_better": greater_is_better,
+        "global_step": global_step,
+        "best_checkpoint_zip": best_zip_path,
+    }
+    with open(os.path.join(output_dir, "best_checkpoint.json"), "w", encoding="utf-8") as f:
+        json.dump(best_checkpoint_payload, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(output_dir, "best_checkpoint.txt"), "w", encoding="utf-8") as f:
+        f.write(best_checkpoint_dir)
+
+    return best_zip_path
+
+
+def prune_non_best_checkpoints(output_dir: str, best_checkpoint: str | None) -> list[str]:
+    if not output_dir or not os.path.isdir(output_dir):
+        return []
+
+    best_checkpoint = os.path.normpath(str(best_checkpoint or "").strip()) if best_checkpoint else ""
+    removed_dirs: list[str] = []
+    for name in os.listdir(output_dir):
+        full_path = os.path.join(output_dir, name)
+        if not (os.path.isdir(full_path) and re.fullmatch(r"checkpoint-\d+", name)):
+            continue
+        norm_full_path = os.path.normpath(full_path)
+        if best_checkpoint and norm_full_path == best_checkpoint:
+            continue
+        shutil.rmtree(full_path, ignore_errors=True)
+        removed_dirs.append(norm_full_path)
+    return removed_dirs
 
 
 def find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -358,6 +532,50 @@ def safe_import_metrics():
         return None, None
 
 
+class PersistBestCheckpointCallback(TrainerCallback):
+    def __init__(self, output_dir: str, metric_for_best_model: str, greater_is_better: bool):
+        self.output_dir = output_dir
+        self.metric_for_best_model = metric_for_best_model
+        self.greater_is_better = greater_is_better
+        self._last_best_checkpoint = ""
+
+    def on_save(self, args, state, control, **kwargs):
+        best_checkpoint = str(state.best_model_checkpoint or "").strip()
+        if best_checkpoint and best_checkpoint != self._last_best_checkpoint and os.path.isdir(best_checkpoint):
+            best_zip_path = persist_best_checkpoint_artifacts(
+                output_dir=self.output_dir,
+                best_model_checkpoint=best_checkpoint,
+                best_metric=state.best_metric,
+                metric_for_best_model=self.metric_for_best_model,
+                greater_is_better=self.greater_is_better,
+                global_step=state.global_step,
+            )
+            self._last_best_checkpoint = best_checkpoint
+            if best_zip_path:
+                print(f"[best] 已更新最佳 checkpoint 压缩包: {best_zip_path}")
+        removed_dirs = prune_non_best_checkpoints(self.output_dir, best_checkpoint)
+        if removed_dirs:
+            print(f"[checkpoint] 已删除非最佳 checkpoint: {len(removed_dirs)} 个")
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        best_checkpoint = str(state.best_model_checkpoint or "").strip()
+        best_zip_path = persist_best_checkpoint_artifacts(
+            output_dir=self.output_dir,
+            best_model_checkpoint=best_checkpoint,
+            best_metric=state.best_metric,
+            metric_for_best_model=self.metric_for_best_model,
+            greater_is_better=self.greater_is_better,
+            global_step=state.global_step,
+        )
+        removed_dirs = prune_non_best_checkpoints(self.output_dir, best_checkpoint)
+        if best_checkpoint and best_zip_path:
+            print(f"[best] 训练结束，最佳 checkpoint 压缩包: {best_zip_path}")
+        if removed_dirs:
+            print(f"[checkpoint] 训练结束已清理非最佳 checkpoint: {len(removed_dirs)} 个")
+        return control
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kaggle: 微调 NLLB-200-distilled-600M v2 (KO -> ZH修正)")
     parser.add_argument("--input-xlsx", default=DEFAULT_INPUT_XLSX)
@@ -380,7 +598,7 @@ def main():
     parser.add_argument("--max-target-length", type=int, default=98)
     parser.add_argument("--generation-max-length", type=int, default=128)
     parser.add_argument("--generation-num-beams", type=int, default=4)
-    parser.add_argument("--per-device-train-batch-size", type=int, default=24)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=32)
     parser.add_argument("--per-device-eval-batch-size", type=int, default=12)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -396,6 +614,7 @@ def main():
     parser.add_argument("--save-steps", type=int, default=1000)
     parser.add_argument("--save-total-limit-checkpoints", type=int, default=2)
     parser.add_argument("--merge-and-save", action="store_true", default=True)
+    parser.add_argument("--resume-from-checkpoint", default="best")
     parser.add_argument("--prefer-bf16", action="store_true")
     parser.add_argument("--no-multi-gpu", action="store_true")
     parser.add_argument("--logging-steps", type=int, default=20)
@@ -440,6 +659,7 @@ def main():
         * int(active_gpu_count)
         * int(args.gradient_accumulation_steps)
     )
+    resume_checkpoint = resolve_resume_checkpoint_path(args.resume_from_checkpoint, args.output_dir)
     print(f"总语料: {len(df)}")
     print(f"训练集: {len(train_df)}")
     print(f"验证集: {len(valid_df)}")
@@ -450,6 +670,8 @@ def main():
     print(
         f"有效总 Batch = per_device_train_batch_size({args.per_device_train_batch_size}) x GPU({active_gpu_count}) x grad_accum({args.gradient_accumulation_steps}) = {effective_global_batch}"
     )
+    if resume_checkpoint:
+        print(f"续训 checkpoint: {resume_checkpoint}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     tokenizer.src_lang = args.src_lang
@@ -500,7 +722,6 @@ def main():
         print("[兼容修复] 已强制重新绑定 NLLB 共享词嵌入，避免 embedding 未共享导致显存翻倍。")
     except Exception as exc:
         print(f"[兼容修复] 重新绑定共享词嵌入失败: {exc}")
-    model.config.forced_bos_token_id = forced_bos_token_id
     model.config.use_cache = False
     if getattr(model, "generation_config", None) is not None:
         model.generation_config.forced_bos_token_id = forced_bos_token_id
@@ -606,6 +827,11 @@ def main():
         dataloader_num_workers=2,
         ddp_find_unused_parameters=False,
     )
+    best_checkpoint_callback = PersistBestCheckpointCallback(
+        output_dir=args.output_dir,
+        metric_for_best_model=training_args.metric_for_best_model,
+        greater_is_better=bool(training_args.greater_is_better),
+    )
 
     trainer = Seq2SeqTrainer(
         model=model,
@@ -614,15 +840,25 @@ def main():
         eval_dataset=valid_ds,
         data_collator=data_collator,
         compute_metrics=compute_metrics if bleu_metric is not None else None,
+        callbacks=[best_checkpoint_callback],
     )
 
-    train_result = trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
     eval_metrics = trainer.evaluate(
         metric_key_prefix="eval",
         max_length=args.generation_max_length,
         num_beams=args.generation_num_beams,
     )
     print("验证结果:", json.dumps(eval_metrics, ensure_ascii=False, indent=2))
+
+    best_checkpoint_zip = persist_best_checkpoint_artifacts(
+        output_dir=args.output_dir,
+        best_model_checkpoint=trainer.state.best_model_checkpoint,
+        best_metric=trainer.state.best_metric,
+        metric_for_best_model=training_args.metric_for_best_model,
+        greater_is_better=bool(training_args.greater_is_better),
+        global_step=trainer.state.global_step,
+    )
 
     metrics_out = {
         "train_result": dict(train_result.metrics),
@@ -631,6 +867,10 @@ def main():
         "use_multi_gpu": use_multi_gpu,
         "effective_global_batch": effective_global_batch,
         "precision": precision_cfg["precision_name"],
+        "resumed_from_checkpoint": resume_checkpoint,
+        "best_model_checkpoint": trainer.state.best_model_checkpoint,
+        "best_metric": trainer.state.best_metric,
+        "best_checkpoint_zip": best_checkpoint_zip,
     }
     with open(os.path.join(args.output_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
         json.dump(metrics_out, f, ensure_ascii=False, indent=2)
@@ -645,7 +885,10 @@ def main():
     if args.merge_and_save:
         merged_dir = os.path.join(args.output_dir, "merged_model")
         merged_model = trainer.model.merge_and_unload()
-        merged_model.config.forced_bos_token_id = forced_bos_token_id
+        if getattr(merged_model, "generation_config", None) is not None:
+            merged_model.generation_config.forced_bos_token_id = forced_bos_token_id
+            merged_model.generation_config.max_length = int(args.generation_max_length)
+            merged_model.generation_config.num_beams = int(args.generation_num_beams)
         merged_model.save_pretrained(merged_dir)
         tokenizer.save_pretrained(merged_dir)
         print(f"已导出合并后的完整模型: {merged_dir}")
@@ -679,8 +922,10 @@ def main():
     print("训练完成。请下载以下目录中的文件到本地：")
     print(f"1) Adapter: {adapter_dir}")
     print(f"2) Metrics: {os.path.join(args.output_dir, 'metrics_summary.json')}")
+    if best_checkpoint_zip:
+        print(f"3) Best checkpoint zip: {best_checkpoint_zip}")
     if args.merge_and_save:
-        print(f"3) Merged model: {os.path.join(args.output_dir, 'merged_model')}")
+        print(f"4) Merged model: {os.path.join(args.output_dir, 'merged_model')}")
 
 
 if __name__ == "__main__":
